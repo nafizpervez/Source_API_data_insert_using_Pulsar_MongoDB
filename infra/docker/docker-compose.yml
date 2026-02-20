@@ -66,6 +66,21 @@ services:
       RETRY_DELAYS_SECONDS: "60,180,540"
       MAX_DELIVERY_ATTEMPTS: "4"
 
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: Dozzle
+    ports:
+      - "9999:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Optional: only show specific containers (recommended)
+      # Comma-separated container names
+      # - DOZZLE_FILTER=name=DotNet-Worker|Pulsar-Message-Broker|Mongo
+      # Optional: timezone for log timestamps
+      - TZ=Asia/Dhaka
+    restart: unless-stopped
+
 volumes:
   mongo_data:
   pulsar_data:
