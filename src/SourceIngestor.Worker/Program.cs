@@ -1,4 +1,3 @@
-using System.Text.Json;
 using DotPulsar;
 using DotPulsar.Abstractions;
 using Microsoft.Extensions.Options;
@@ -12,15 +11,6 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Services.Configure<PulsarOptions>(builder.Configuration.GetSection("Pulsar"));
 builder.Services.Configure<MongoOptions>(builder.Configuration.GetSection("Mongo"));
 builder.Services.Configure<SourceApiOptions>(builder.Configuration.GetSection("SourceApi"));
-
-// ✅ JSON options for the whole worker
-builder.Services.AddSingleton(new JsonSerializerOptions
-{
-    PropertyNameCaseInsensitive = true,
-    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-    // Optional: makes JSON output readable for debugging
-    // WriteIndented = true
-});
 
 // Http client
 builder.Services.AddHttpClient("source", http =>

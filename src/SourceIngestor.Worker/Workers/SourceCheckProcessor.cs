@@ -1,4 +1,3 @@
-// D:\Source_API_data_insert_using_Pulsar_MongoDB\src\SourceIngestor.Worker\Workers\SourceCheckProcessor.cs
 using System.Net;
 using System.Text.Json;
 using DotPulsar;
@@ -30,7 +29,6 @@ public sealed class SourceCheckProcessor : BackgroundService
     private readonly IHttpClientFactory _httpFactory;
     private readonly PulsarOptions _pulsar;
     private readonly SourceApiOptions _api;
-    private readonly JsonSerializerOptions _json;
     private readonly ILogger<SourceCheckProcessor> _logger;
 
     public SourceCheckProcessor(
@@ -38,14 +36,12 @@ public sealed class SourceCheckProcessor : BackgroundService
         IHttpClientFactory httpFactory,
         IOptions<PulsarOptions> pulsar,
         IOptions<SourceApiOptions> api,
-        JsonSerializerOptions json,
         ILogger<SourceCheckProcessor> logger)
     {
         _pulsarClient = pulsarClient;
         _httpFactory = httpFactory;
         _pulsar = pulsar.Value;
         _api = api.Value;
-        _json = json;
         _logger = logger;
     }
 
@@ -77,7 +73,7 @@ public sealed class SourceCheckProcessor : BackgroundService
 
         // Seed 1 job so it runs immediately (Attempt 0)
         var seed = new SourceCheckJob(_api.PostsUrl, Attempt: 0, CreatedAtUtc: DateTimeOffset.UtcNow);
-        var seedJson = JsonSerializer.Serialize(seed, _json);
+        var seedJson = JsonSerializer.Serialize(seed);
         await checkProducer.Send(seedJson, stoppingToken);
 
         _logger.LogInformation("Seeded SourceCheckJob (attempt=0) into {Topic}", _pulsar.SourceCheckTopic);
@@ -88,7 +84,7 @@ public sealed class SourceCheckProcessor : BackgroundService
             {
                 var payload = msg.Value();
 
-                var job = JsonSerializer.Deserialize<SourceCheckJob>(payload, _json);
+                var job = JsonSerializer.Deserialize<SourceCheckJob>(payload);
                 if (job is null)
                 {
                     _logger.LogWarning("Invalid SourceCheckJob payload. ack+skip. payload={Payload}", payload);
@@ -123,15 +119,17 @@ public sealed class SourceCheckProcessor : BackgroundService
 
                 var rawJson = fetch.RawJson!;
 
-                // Build a simple runtime type map (for logging/debugging in Mongo)
                 var typeMap = JsonTypeMap.BuildTypeMapFromFirstArrayObject(rawJson);
 
-                // Strongly-typed payload (optional but useful)
-                var posts = JsonSerializer.Deserialize<List<PostDto>>(rawJson, _json) ?? new List<PostDto>();
+                // if you want to include strongly-typed payload in the envelope
+
+                var posts = JsonSerializer.Deserialize<List<PostDto>>(rawJson, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                }) ?? new List<PostDto>();
 
                 // Publish the batch envelope to Pulsar
-                // NOTE: this assumes PostsBatchEnvelope has these settable properties:
-                // SourceUrl, FetchedAtUtc, PayloadRawJson, TypeMap, Payload
+
                 var envelope = new PostsBatchEnvelope
                 {
                     SourceUrl = job.Url,
@@ -141,7 +139,7 @@ public sealed class SourceCheckProcessor : BackgroundService
                     Payload = posts
                 };
 
-                var envJson = JsonSerializer.Serialize(envelope, _json);
+                var envJson = JsonSerializer.Serialize(envelope);
                 await batchProducer.Send(envJson, stoppingToken);
 
                 _logger.LogInformation(
@@ -189,6 +187,7 @@ public sealed class SourceCheckProcessor : BackgroundService
             // Treat "cannot find data" as:
             // - empty/whitespace
             // - or looks like an empty JSON array "[]"
+            // You can tighten this rule if needed.
             if (string.IsNullOrWhiteSpace(raw))
             {
                 return new FetchResult(
@@ -210,7 +209,8 @@ public sealed class SourceCheckProcessor : BackgroundService
                 );
             }
 
-            // Ensure it's a JSON array (expected for /posts)
+            // Optional: ensure it's a JSON array (expected for /posts)
+            // If not array, treat as failure to meet contract.
             if (!trimmed.StartsWith("[", StringComparison.Ordinal))
             {
                 return new FetchResult(
@@ -288,7 +288,7 @@ public sealed class SourceCheckProcessor : BackgroundService
                 lastStatus = fetch.StatusCode?.ToString(),
                 lastReason = fetch.Reason,
                 reason = "Source API unavailable after attempts: 0 (immediate), 1(+1m), 2(+3m), 3(+9m)"
-            }, _json);
+            });
 
             await dlqProducer.Send(dlqPayload, ct);
             return;
@@ -302,11 +302,11 @@ public sealed class SourceCheckProcessor : BackgroundService
             job.Attempt, nextAttempt, delay, deliverAtUtc, job.Url);
 
         var nextJob = job with { Attempt = nextAttempt };
-        var nextPayload = JsonSerializer.Serialize(nextJob, _json);
+        var payload = JsonSerializer.Serialize(nextJob);
 
         // Pulsar delayed delivery
         await checkProducer.NewMessage()
             .DeliverAt(deliverAtUtc.UtcDateTime)
-            .Send(nextPayload, ct);
+            .Send(payload, ct);
     }
 }

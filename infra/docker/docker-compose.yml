@@ -60,6 +60,7 @@ services:
       Mongo__ConnectionString: "mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/?authSource=admin"
       Mongo__Database: "API_Integration"
       Mongo__Collection: "FetchedSourceData"
+      Mongo__TimeZoneId: "${MONGO_TIMEZONE_ID}"
 
       SourceApi__PostsUrl: "https://jsonplaceholder.typicode.com/posts"
 
