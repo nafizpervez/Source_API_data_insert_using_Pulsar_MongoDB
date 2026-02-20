@@ -37,6 +37,7 @@ builder.Services.AddSingleton<IMongoClient>(_ =>
 // Hosted services
 builder.Services.AddHostedService<SourceCheckProcessor>();
 builder.Services.AddHostedService<MongoWriter>();
+builder.Services.AddHostedService<ValidationProcessor>();
 
 var host = builder.Build();
 host.Run();

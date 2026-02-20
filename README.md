@@ -56,7 +56,7 @@ docker images
 Run from root:
 
 ```powershell
-docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env build
+docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env build  --no-cache
 ```
 
 **Why this command**
@@ -158,7 +158,7 @@ docker rmi -f api-integration-worker
 ```
 
 ```powershell
-docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env build
+docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env build --no-cache
 ```
 
 ```powershell
