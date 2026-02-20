@@ -25,12 +25,15 @@ public sealed class ValidationProcessor : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var db = _mongoClient.GetDatabase(_mongo.Database);
+
         var sourceCol = db.GetCollection<BsonDocument>(_mongo.Collection);
         var validatedCol = db.GetCollection<BsonDocument>(_mongo.ValidatedCollection);
+        var invalidCol = db.GetCollection<BsonDocument>(_mongo.InvalidCollection);
 
         _logger.LogInformation("ValidationProcessor started.");
         _logger.LogInformation("Mongo source: {Db}.{Col}", _mongo.Database, _mongo.Collection);
-        _logger.LogInformation("Mongo target: {Db}.{Col}", _mongo.Database, _mongo.ValidatedCollection);
+        _logger.LogInformation("Mongo target(valid): {Db}.{Col}", _mongo.Database, _mongo.ValidatedCollection);
+        _logger.LogInformation("Mongo target(invalid): {Db}.{Col}", _mongo.Database, _mongo.InvalidCollection);
 
 
         // Watermark for this process lifetime
@@ -72,21 +75,42 @@ public sealed class ValidationProcessor : BackgroundService
 
                     if (!src.TryGetValue("payload", out var payloadVal) || payloadVal.BsonType != BsonType.Array)
                     {
-                        // Keep only the latest validated batch (even if it's an error doc)
+                        // Keep only the latest output docs
                         await validatedCol.DeleteManyAsync(FilterDefinition<BsonDocument>.Empty, stoppingToken);
-                        
-                        await UpsertValidatedBatch(validatedCol, srcId, sourceUrl, fetchedAtLocalText, timeZoneId, typeMap,
+                        await invalidCol.DeleteManyAsync(FilterDefinition<BsonDocument>.Empty, stoppingToken);
+
+                        var errArr = new BsonArray
+                        {
+                            new BsonDocument
+                            {
+                                { "index", -1 },
+                                { "reason", "missing_or_non_array_payload" }
+                            }
+                        };
+
+                        await UpsertValidatedBatch(
+                            validatedCol,
+                            srcId,
+                            sourceUrl,
+                            fetchedAtLocalText,
+                            timeZoneId,
+                            typeMap,
                             validatedItems: new BsonArray(),
                             validCount: 0,
                             invalidCount: 0,
-                            errors: new BsonArray
-                            {
-                                new BsonDocument
-                                {
-                                    { "index", -1 },
-                                    { "reason", "missing_or_non_array_payload" }
-                                }
-                            },
+                            errors: errArr,
+                            stoppingToken);
+
+                        await UpsertInvalidBatch(
+                            invalidCol,
+                            srcId,
+                            sourceUrl,
+                            fetchedAtLocalText,
+                            timeZoneId,
+                            typeMap,
+                            invalidItems: new BsonArray(),
+                            invalidCount: 0,
+                            errors: errArr,
                             stoppingToken);
 
                         continue;
@@ -95,6 +119,7 @@ public sealed class ValidationProcessor : BackgroundService
                     var payload = payloadVal.AsBsonArray;
 
                     var validatedItemsArr = new BsonArray();
+                    var invalidItemsArr = new BsonArray();
                     var errorsArr = new BsonArray();
 
                     var validCount = 0;
@@ -118,28 +143,40 @@ public sealed class ValidationProcessor : BackgroundService
 
                         var doc = item.AsBsonDocument;
 
-                        // Convert based on ValidateFieldTypeDto expectations
                         var okUserId = TryGetInt(doc, "userId", out var userId, out var userIdErr);
                         var okId = TryGetInt(doc, "id", out var id, out var idErr);
 
-                        // Title must be string (we will coerce non-string to string to keep pipeline moving)
-                        var title = GetStringCoerce(doc, "title");
+                        // NEW RULES:
+                        // title must exist AND not be null (empty string is allowed)
+                        var okTitle = TryGetRequiredNonNullField(doc, "title", out var titleErr);
+                        var title = GetStringCoerce(doc, "title"); // we still coerce non-string -> string
 
-                        // Body can be null (DTO allows string?)
-                        var body = GetNullableStringCoerce(doc, "body");
+                        // body must exist AND not be null (empty string is allowed)
+                        var okBody = TryGetRequiredNonNullField(doc, "body", out var bodyErr);
+                        var body = GetStringOrNull(doc, "body"); // keep as string value, null if missing/null (we'll mark invalid)
 
-                        if (!okUserId || !okId)
+                        if (!okUserId || !okId || !okTitle || !okBody)
                         {
                             invalidCount++;
 
                             var err = new BsonDocument { { "index", i } };
                             if (!okUserId) err.Add("userId", userIdErr);
                             if (!okId) err.Add("id", idErr);
+                            if (!okTitle) err.Add("title", titleErr);
+                            if (!okBody) err.Add("body", bodyErr);
 
-                            // Keep a small raw snapshot (avoid huge logs)
                             err.Add("raw", ShrinkRaw(doc, maxChars: 500));
-
                             errorsArr.Add(err);
+
+                            // Store invalid item snapshot in InvalidSourceData payload
+                            invalidItemsArr.Add(new BsonDocument
+                            {
+                                { "userId", doc.GetValue("userId", BsonNull.Value) },
+                                { "id", doc.GetValue("id", BsonNull.Value) },
+                                { "title", doc.GetValue("title", BsonNull.Value) },
+                                { "body", doc.GetValue("body", BsonNull.Value) }
+                            });
+
                             continue;
                         }
 
@@ -150,15 +187,15 @@ public sealed class ValidationProcessor : BackgroundService
                             { "UserId", userId },
                             { "Id", id },
                             { "Title", title ?? "" },
-                            { "Body", body } // can be BsonNull
+                            { "Body", body.AsString } // body is guaranteed non-null here
                         };
 
                         validatedItemsArr.Add(validated);
                         validCount++;
                     }
 
-                    // Keep only the latest validated batch: clear existing docs before inserting/upserting the new one.
                     await validatedCol.DeleteManyAsync(FilterDefinition<BsonDocument>.Empty, stoppingToken);
+                    await invalidCol.DeleteManyAsync(FilterDefinition<BsonDocument>.Empty, stoppingToken);
 
                     await UpsertValidatedBatch(
                         validatedCol,
@@ -172,6 +209,19 @@ public sealed class ValidationProcessor : BackgroundService
                         invalidCount,
                         errorsArr,
                         stoppingToken);
+
+                    await UpsertInvalidBatch(
+                        invalidCol,
+                        srcId,
+                        sourceUrl,
+                        fetchedAtLocalText,
+                        timeZoneId,
+                        typeMap,
+                        invalidItemsArr,
+                        invalidCount,
+                        errorsArr,
+                        stoppingToken);
+
 
                     _logger.LogInformation(
                         "Validated batch sourceDocId={SourceDocId} valid={Valid} invalid={Invalid} target={Db}.{Col}",
@@ -236,6 +286,82 @@ public sealed class ValidationProcessor : BackgroundService
             new ReplaceOptions { IsUpsert = true },
             ct);
     }
+
+    private static async Task UpsertInvalidBatch(
+    IMongoCollection<BsonDocument> invalidCol,
+    ObjectId sourceDocId,
+    BsonValue sourceUrl,
+    BsonValue fetchedAtLocalText,
+    BsonValue timeZoneId,
+    BsonValue typeMap,
+    BsonArray invalidItems,
+    int invalidCount,
+    BsonArray errors,
+    CancellationToken ct)
+{
+    var invalidDoc = new BsonDocument
+    {
+        { "sourceDocId", sourceDocId },
+        { "sourceUrl", sourceUrl },
+        { "fetchedAtLocalText", fetchedAtLocalText },
+        { "timeZoneId", timeZoneId },
+
+        { "itemCount", invalidItems.Count },
+        { "invalidCount", invalidCount },
+
+        { "typeMapSource", typeMap },
+
+        // Optional: document expected/validated types (same as your converted schema)
+        { "typeMapExpected", new BsonDocument
+            {
+                { "userId", "int" },
+                { "id", "int" },
+                { "title", "string" },
+                { "body", "string" }
+            }
+        },
+
+        { "payload", invalidItems },
+        { "errors", errors }
+    };
+
+    var filter = Builders<BsonDocument>.Filter.Eq("sourceDocId", sourceDocId);
+
+    await invalidCol.ReplaceOneAsync(
+        filter,
+        invalidDoc,
+        new ReplaceOptions { IsUpsert = true },
+        ct);
+}
+
+// title/body must exist and must not be null (empty string is acceptable)
+private static bool TryGetRequiredNonNullField(BsonDocument doc, string key, out string error)
+{
+    error = "";
+
+    if (!doc.Contains(key))
+    {
+        error = "missing";
+        return false;
+    }
+
+    var v = doc[key];
+    if (v.IsBsonNull)
+    {
+        error = "null_not_allowed";
+        return false;
+    }
+
+    return true;
+}
+
+private static BsonValue GetStringOrNull(BsonDocument doc, string key)
+{
+    if (!doc.TryGetValue(key, out var v) || v.IsBsonNull)
+        return BsonNull.Value;
+
+    return v.BsonType == BsonType.String ? v.AsString : v.ToString();
+}
 
     private static bool TryGetInt(BsonDocument doc, string key, out int value, out string error)
     {

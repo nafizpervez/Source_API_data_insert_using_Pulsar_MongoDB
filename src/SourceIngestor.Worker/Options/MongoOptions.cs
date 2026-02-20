@@ -11,5 +11,8 @@ public sealed class MongoOptions
     // Target collection (validated/typed batches)
     public string ValidatedCollection { get; set; } = "ValidatedSourceData";
 
+    // Target collection (invalid items from the batch)
+    public string InvalidCollection { get; set; } = "InvalidSourceData";
+
     public string? TimeZoneId { get; set; }
 }
