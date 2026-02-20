@@ -72,6 +72,9 @@ public sealed class ValidationProcessor : BackgroundService
 
                     if (!src.TryGetValue("payload", out var payloadVal) || payloadVal.BsonType != BsonType.Array)
                     {
+                        // Keep only the latest validated batch (even if it's an error doc)
+                        await validatedCol.DeleteManyAsync(FilterDefinition<BsonDocument>.Empty, stoppingToken);
+                        
                         await UpsertValidatedBatch(validatedCol, srcId, sourceUrl, fetchedAtLocalText, timeZoneId, typeMap,
                             validatedItems: new BsonArray(),
                             validCount: 0,
@@ -153,6 +156,9 @@ public sealed class ValidationProcessor : BackgroundService
                         validatedItemsArr.Add(validated);
                         validCount++;
                     }
+
+                    // Keep only the latest validated batch: clear existing docs before inserting/upserting the new one.
+                    await validatedCol.DeleteManyAsync(FilterDefinition<BsonDocument>.Empty, stoppingToken);
 
                     await UpsertValidatedBatch(
                         validatedCol,

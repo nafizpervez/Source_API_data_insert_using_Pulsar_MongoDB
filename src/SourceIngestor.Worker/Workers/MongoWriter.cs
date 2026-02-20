@@ -104,6 +104,9 @@ public sealed class MongoWriter : BackgroundService
                     { "typeMap", typeMapDoc },
                     { "payload", items }
                 };
+                
+                // Keep only the latest batch: clear existing docs before inserting the new one.
+                await col.DeleteManyAsync(FilterDefinition<BsonDocument>.Empty, cancellationToken: stoppingToken);
 
                 await col.InsertOneAsync(doc, cancellationToken: stoppingToken);
 
