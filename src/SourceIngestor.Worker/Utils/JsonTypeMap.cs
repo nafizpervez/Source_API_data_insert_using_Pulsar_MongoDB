@@ -1,37 +1,50 @@
 using System.Text.Json;
-using System.Text.Json.Nodes;
 
 namespace SourceIngestor.Worker.Utils;
 
 public static class JsonTypeMap
 {
+    // Builds a "fieldName -> jsonType" map from the first object in a JSON array payload.
+    // jsonType values are JSON-native: number|string|boolean|null|object|array
     public static Dictionary<string, string> BuildTypeMapFromFirstArrayObject(string rawJson)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        JsonNode? node;
-        try { node = JsonNode.Parse(rawJson); }
-        catch { return map; }
+        if (string.IsNullOrWhiteSpace(rawJson))
+            return map;
 
-        var first = node?.AsArray().FirstOrDefault()?.AsObject();
-        if (first is null) return map;
-
-        foreach (var kv in first)
+        try
         {
-            map[kv.Key] = kv.Value switch
-            {
-                null => "null",
-                JsonValue v when v.TryGetValue<int>(out _) => "int",
-                JsonValue v when v.TryGetValue<long>(out _) => "long",
-                JsonValue v when v.TryGetValue<double>(out _) => "double",
-                JsonValue v when v.TryGetValue<bool>(out _) => "bool",
-                JsonValue v when v.TryGetValue<string>(out _) => "string",
-                JsonArray => "array",
-                JsonObject => "object",
-                _ => "unknown"
-            };
-        }
+            using var doc = JsonDocument.Parse(rawJson);
+            var root = doc.RootElement;
 
-        return map;
+            if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() == 0)
+                return map;
+
+            var first = root[0];
+            if (first.ValueKind != JsonValueKind.Object)
+                return map;
+
+            foreach (var prop in first.EnumerateObject())
+            {
+                map[prop.Name] = prop.Value.ValueKind switch
+                {
+                    JsonValueKind.Number => "number",
+                    JsonValueKind.String => "string",
+                    JsonValueKind.True or JsonValueKind.False => "boolean",
+                    JsonValueKind.Null => "null",
+                    JsonValueKind.Object => "object",
+                    JsonValueKind.Array => "array",
+                    JsonValueKind.Undefined => "undefined",
+                    _ => "unknown"
+                };
+            }
+
+            return map;
+        }
+        catch
+        {
+            return map;
+        }
     }
 }

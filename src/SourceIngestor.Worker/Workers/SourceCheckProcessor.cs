@@ -119,24 +119,21 @@ public sealed class SourceCheckProcessor : BackgroundService
 
                 var rawJson = fetch.RawJson!;
 
+                // for seeing the data type for field coming from source
                 var typeMap = JsonTypeMap.BuildTypeMapFromFirstArrayObject(rawJson);
 
-                // if you want to include strongly-typed payload in the envelope
-
-                var posts = JsonSerializer.Deserialize<List<PostDto>>(rawJson, new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                }) ?? new List<PostDto>();
+                // Publish the batch
+                using var doc = JsonDocument.Parse(rawJson);
+                var sourcePayload = doc.RootElement.Clone();
 
                 // Publish the batch envelope to Pulsar
-
                 var envelope = new PostsBatchEnvelope
                 {
                     SourceUrl = job.Url,
                     FetchedAtUtc = DateTimeOffset.UtcNow,
                     PayloadRawJson = rawJson,
                     TypeMap = typeMap,
-                    Payload = posts
+                    payload = sourcePayload
                 };
 
                 var envJson = JsonSerializer.Serialize(envelope);

@@ -7,6 +7,7 @@ using DotPulsar.Abstractions;
 using DotPulsar.Extensions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using SourceIngestor.Worker.Messaging.Contracts;
 using SourceIngestor.Worker.Options;
@@ -90,7 +91,7 @@ public sealed class MongoWriter : BackgroundService
                 var offset = tz.GetUtcOffset(fetchedUtc);
                 var sign = offset >= TimeSpan.Zero ? "+" : "-";
                 var abs = offset.Duration();
-                var offsetText = $"{sign}{abs:hh\\:mm}";
+                var offsetText = $" {sign}{abs:hh\\:mm}";
                 var timeZoneDisplay = $"{tz.Id} UTC{offsetText}";
 
                 // IMPORTANT: You requested fetchedAtUtc should NOT be stored.
