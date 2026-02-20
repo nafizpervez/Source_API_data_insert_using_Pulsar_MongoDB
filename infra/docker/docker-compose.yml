@@ -1,0 +1,72 @@
+name: api_integration
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: Mongo
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "${MONGO_INITDB_ROOT_USERNAME}"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_INITDB_ROOT_PASSWORD}"
+    volumes:
+      - mongo_data:/data/db
+
+  mongo-express:
+    image: mongo-express:1
+    container_name: Mongo-Express
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    ports:
+      - "${MONGO_EXPRESS_PORT:-8081}:8081"
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: "${MONGO_INITDB_ROOT_USERNAME}"
+      ME_CONFIG_MONGODB_ADMINPASSWORD: "${MONGO_INITDB_ROOT_PASSWORD}"
+      ME_CONFIG_MONGODB_SERVER: "mongo"
+      ME_CONFIG_MONGODB_PORT: "27017"
+      ME_CONFIG_BASICAUTH: "false"
+
+  pulsar:
+    image: apachepulsar/pulsar:3.3.1
+    container_name: Pulsar-Message-Broker
+    restart: unless-stopped
+    command: ["bin/pulsar", "standalone"]
+    ports:
+      - "${PULSAR_BROKER_PORT:-6650}:6650"
+      - "${PULSAR_HTTP_PORT:-8080}:8080"
+    volumes:
+      - pulsar_data:/pulsar/data
+      - pulsar_conf:/pulsar/conf
+
+  source-ingestor-worker:
+    image: api_integration-worker:latest
+    container_name: DotNet-Worker
+    restart: unless-stopped
+    depends_on:
+      - pulsar
+      - mongo
+    build:
+      context: ../..
+      dockerfile: src/SourceIngestor.Worker/Dockerfile
+    environment:
+      Pulsar__ServiceUrl: "pulsar://pulsar:6650"
+      Pulsar__SourceCheckTopic: "persistent://public/default/source-check"
+      Pulsar__PostsBatchTopic: "persistent://public/default/posts-batch"
+      Pulsar__DlqTopic: "persistent://public/default/source-check-dlq"
+      Pulsar__Subscription: "source-ingestor-sub"
+
+      Mongo__ConnectionString: "mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/?authSource=admin"
+      Mongo__Database: "API_Integration"
+      Mongo__Collection: "FetchedSourceData"
+
+      SourceApi__PostsUrl: "https://jsonplaceholder.typicode.com/posts"
+
+      RETRY_DELAYS_SECONDS: "60,180,540"
+      MAX_DELIVERY_ATTEMPTS: "4"
+
+volumes:
+  mongo_data:
+  pulsar_data:
+  pulsar_conf:
