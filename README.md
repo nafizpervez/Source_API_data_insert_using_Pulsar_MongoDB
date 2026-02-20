@@ -33,6 +33,12 @@ docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-fil
 docker rmi -f api-integration-worker
 ```
 
+### Remove the whole Container with Cache
+
+```powershell
+docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down -v --rmi all
+```
+
 **Why this command**
 
 - Ensures the worker image is rebuilt cleanly (no stale layers)
@@ -141,6 +147,10 @@ docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-fil
 
 ```powershell
 docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down -v
+```
+
+```powershell
+docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down -v --rmi all
 ```
 
 ```powershell
