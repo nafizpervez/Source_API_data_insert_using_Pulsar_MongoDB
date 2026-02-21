@@ -14,6 +14,9 @@ public sealed class MongoOptions
     // Target collection (invalid items from the batch)
     public string InvalidCollection { get; set; } = "InvalidSourceData";
 
+    // NEW: duplicate items collection (dedup output)
+    public string DuplicatedCollection { get; set; } = "Duplicated_Data";
+
     // Destination raw snapshot collection (ArcGIS FS read)
     public string DestinationRawCollection { get; set; } = "Destination_Raw_Data";
 

@@ -12,6 +12,7 @@ builder.Services.Configure<MongoOptions>(builder.Configuration.GetSection("Mongo
 builder.Services.Configure<SourceApiOptions>(builder.Configuration.GetSection("SourceApi"));
 builder.Services.Configure<ArcGisPortalOptions>(builder.Configuration.GetSection("ArcGisPortal"));
 builder.Services.Configure<DestinationApiOptions>(builder.Configuration.GetSection("DestinationApi"));
+builder.Services.Configure<DuplicationOptions>(builder.Configuration.GetSection("Duplication"));
 
 // Http clients
 builder.Services.AddHttpClient("source", http =>
