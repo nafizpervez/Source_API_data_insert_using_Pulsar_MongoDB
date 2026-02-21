@@ -14,5 +14,8 @@ public sealed class MongoOptions
     // Target collection (invalid items from the batch)
     public string InvalidCollection { get; set; } = "InvalidSourceData";
 
+    // Destination raw snapshot collection (ArcGIS FS read)
+    public string DestinationRawCollection { get; set; } = "Destination_Raw_Data";
+
     public string? TimeZoneId { get; set; }
 }

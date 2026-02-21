@@ -23,6 +23,19 @@ docker compose -p api-integration-f .\infra\docker\docker-compose.yml --env-file
 docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down -v
 ```
 
+**Force: Remove Containers + volumes + orphans**
+
+```powershell
+docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down --remove-orphans -v
+```
+
+**If Doesn't work then use**
+
+```powershell
+docker rm -f (docker ps -aq)
+```
+
+
 **Why this command**
 
 - Removes volumes as well, so MongoDB starts fresh on next run
@@ -147,6 +160,14 @@ docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-fil
 
 ```powershell
 docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down -v
+```
+
+```powershell
+docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down --remove-orphans -v
+```
+
+```powershell
+docker rm -f (docker ps -aq)
 ```
 
 ```powershell
