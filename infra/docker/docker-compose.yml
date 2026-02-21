@@ -82,12 +82,6 @@ services:
     environment:
       - TZ="${MONGO_TIMEZONE_ID}"
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q dozzle"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 20s
 
 volumes:
   mongo_data:
