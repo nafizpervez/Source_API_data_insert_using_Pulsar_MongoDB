@@ -61,9 +61,6 @@ services:
       Mongo__Database: "API_Integration"
       Mongo__Collection: "FetchedSourceData"
       Mongo__TimeZoneId: "${MONGO_TIMEZONE_ID}"
-
-      SourceApi__PostsUrl: "https://jsonplaceholder.typicode.com/posts"
-
       RETRY_DELAYS_SECONDS: "60,180,540"
       MAX_DELIVERY_ATTEMPTS: "4"
 

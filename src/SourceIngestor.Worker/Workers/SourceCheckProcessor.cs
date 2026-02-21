@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using DotPulsar;
 using DotPulsar.Abstractions;
@@ -119,29 +120,72 @@ public sealed class SourceCheckProcessor : BackgroundService
 
                 var rawJson = fetch.RawJson!;
 
-                // for seeing the data type for field coming from source
-                var typeMap = JsonTypeMap.BuildTypeMapFromFirstArrayObject(rawJson);
+                // Max chunk size from appsettings.json (SourceApi:MaxItemsPerBatch)
+                var maxPerBatch = _api.MaxItemsPerBatch;
+                if (maxPerBatch <= 0) maxPerBatch = 1000;
 
-                // Publish the batch
                 using var doc = JsonDocument.Parse(rawJson);
-                var sourcePayload = doc.RootElement.Clone();
-
-                // Publish the batch envelope to Pulsar
-                var envelope = new PostsBatchEnvelope
+                if (doc.RootElement.ValueKind != JsonValueKind.Array)
                 {
-                    SourceUrl = job.Url,
-                    FetchedAtUtc = DateTimeOffset.UtcNow,
-                    PayloadRawJson = rawJson,
-                    TypeMap = typeMap,
-                    payload = sourcePayload
-                };
+                    _logger.LogWarning("Expected JSON array but got {Kind}. Treating as failure.", doc.RootElement.ValueKind);
+                    await ScheduleRetryOrDlq(job, checkProducer, dlqProducer,
+                        new FetchResult(false, fetch.StatusCode, null, "unexpected_json_shape_non_array"), stoppingToken);
+                    await consumer.Acknowledge(msg, stoppingToken);
+                    continue;
+                }
 
-                var envJson = JsonSerializer.Serialize(envelope);
-                await batchProducer.Send(envJson, stoppingToken);
+                var arr = doc.RootElement;
+                var total = arr.GetArrayLength();
+
+                _logger.LogInformation("Chunking source array. totalItems={Total} maxPerBatch={Max}", total, maxPerBatch);
+
+                var published = 0;
+
+                for (var start = 0; start < total; start += maxPerBatch)
+                {
+                    var take = Math.Min(maxPerBatch, total - start);
+
+                    // Build chunk JSON array string
+                    using var ms = new MemoryStream();
+                    using (var writer = new Utf8JsonWriter(ms))
+                    {
+                        writer.WriteStartArray();
+                        for (var i = start; i < start + take; i++)
+                            arr[i].WriteTo(writer);
+                        writer.WriteEndArray();
+                    }
+
+                    var chunkJson = Encoding.UTF8.GetString(ms.ToArray());
+
+                    // Type map from the chunk’s first object (more accurate per batch)
+                    var typeMap = JsonTypeMap.BuildTypeMapFromFirstArrayObject(chunkJson);
+
+                    // Keep payload JsonElement (you currently store it in envelope)
+                    using var chunkDoc = JsonDocument.Parse(chunkJson);
+                    var chunkPayload = chunkDoc.RootElement.Clone();
+
+                    var envelope = new PostsBatchEnvelope
+                    {
+                        SourceUrl = job.Url,
+                        FetchedAtUtc = DateTimeOffset.UtcNow,
+                        PayloadRawJson = chunkJson,
+                        TypeMap = typeMap,
+                        payload = chunkPayload
+                    };
+
+                    var envJson = JsonSerializer.Serialize(envelope);
+                    await batchProducer.Send(envJson, stoppingToken);
+
+                    published++;
+
+                    _logger.LogInformation(
+                        "PUBLISHED_BATCH_PART url={Url} topic={Topic} attempt={Attempt} part={Part} start={Start} take={Take}",
+                        job.Url, _pulsar.PostsBatchTopic, job.Attempt, published, start, take);
+                }
 
                 _logger.LogInformation(
-                    "PUBLISHED_BATCH url={Url} topic={Topic} attempt={Attempt}",
-                    job.Url, _pulsar.PostsBatchTopic, job.Attempt);
+                    "PUBLISHED_BATCH_DONE url={Url} totalItems={Total} parts={Parts} maxPerBatch={Max}",
+                    job.Url, total, published, maxPerBatch);
 
                 await consumer.Acknowledge(msg, stoppingToken);
             }
