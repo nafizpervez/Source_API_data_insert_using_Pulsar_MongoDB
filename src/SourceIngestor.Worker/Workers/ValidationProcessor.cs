@@ -275,7 +275,7 @@ public sealed class ValidationProcessor : BackgroundService
                 }
             },
             { "payload", validatedItems },
-            { "errors", errors }
+            // { "errors", errors }
         };
 
         var filter = Builders<BsonDocument>.Filter.Eq("sourceDocId", sourceDocId);
@@ -312,7 +312,7 @@ public sealed class ValidationProcessor : BackgroundService
         { "typeMapSource", typeMap },
 
         // Optional: document expected/validated types (same as your converted schema)
-        { "typeMapExpected", new BsonDocument
+        { "typeMapConverted", new BsonDocument
             {
                 { "userId", "int" },
                 { "id", "int" },
@@ -322,7 +322,7 @@ public sealed class ValidationProcessor : BackgroundService
         },
 
         { "payload", invalidItems },
-        { "errors", errors }
+        // { "errors", errors }
     };
 
     var filter = Builders<BsonDocument>.Filter.Eq("sourceDocId", sourceDocId);

@@ -30,7 +30,7 @@ docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-fil
 ### B) Remove the worker image (forces rebuild from scratch)
 
 ```powershell
-docker rmi -f api-integration-worker
+docker rmi -f dotnet-worker
 ```
 
 ### Remove the whole Container with Cache
@@ -154,7 +154,7 @@ docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-fil
 ```
 
 ```powershell
-docker rmi -f api-integration-worker
+docker rmi -f dotnet-worker
 ```
 
 ```powershell
