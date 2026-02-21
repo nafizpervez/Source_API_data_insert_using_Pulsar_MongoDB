@@ -1,6 +1,5 @@
 using DotPulsar;
 using DotPulsar.Abstractions;
-using Microsoft.Extensions.Options;
 using MongoDB.Driver;
 using SourceIngestor.Worker.Options;
 using SourceIngestor.Worker.Workers;
@@ -46,7 +45,7 @@ builder.Services.AddHostedService<SourceCheckProcessor>();
 builder.Services.AddHostedService<MongoWriter>();
 builder.Services.AddHostedService<ValidationProcessor>();
 
-// NEW: Destination read/sync worker (Portal token -> FeatureServer query -> Mongo Destination_Raw_Data)
+// Destination worker remains as-is (we will add Destination_Success_ID / Destination_Failer_ID later)
 builder.Services.AddHostedService<DestinationRawSyncProcessor>();
 
 var host = builder.Build();

@@ -3,7 +3,9 @@ WORKDIR /src
 
 COPY . .
 WORKDIR /src/src/SourceIngestor.Worker
-RUN dotnet publish -c Release -o /app/publish
+
+RUN dotnet restore
+RUN dotnet publish -c Release -o /app/publish --no-restore
 
 FROM mcr.microsoft.com/dotnet/runtime:10.0
 WORKDIR /app

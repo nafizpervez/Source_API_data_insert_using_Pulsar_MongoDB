@@ -17,5 +17,9 @@ public sealed class MongoOptions
     // Destination raw snapshot collection (ArcGIS FS read)
     public string DestinationRawCollection { get; set; } = "Destination_Raw_Data";
 
+    // NEW: Source API fetch outcome collections (same DB)
+    public string SourceSuccessIdCollection { get; set; } = "Source_Success_ID";
+    public string SourceFailedIdCollection { get; set; } = "Source_Failed_ID";
+
     public string? TimeZoneId { get; set; }
 }

@@ -151,30 +151,10 @@ mongodb://admin:admin123@localhost:27017/?authSource=admin
 
 ---
 
-## 6) Codes in Sequence for fast running
-
-```powershell
-docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down
-```
-
-```powershell
-docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down -v
-```
-
-```powershell
-docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down --remove-orphans -v
-```
-
-```powershell
-docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env rm -f (docker ps -aq)
-```
+## 6) Codes in Sequence for fast running (only use these to run the full project)
 
 ```powershell
 docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env down -v --rmi all
-```
-
-```powershell
-docker rmi -f dotnet-worker
 ```
 
 ```powershell
