@@ -59,7 +59,9 @@ services:
 
       Mongo__ConnectionString: "mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/?authSource=admin"
       Mongo__Database: "API_Integration"
-      Mongo__Collection: "FetchedSourceData"
+      Mongo__Collection: "Source_Data"
+      Mongo__ValidatedCollection: "Valid_Data"
+      Mongo__InvalidCollection: "Invalid_Data"
       Mongo__TimeZoneId: "${MONGO_TIMEZONE_ID}"
       RETRY_DELAYS_SECONDS: "60,180,540"
       MAX_DELIVERY_ATTEMPTS: "4"
