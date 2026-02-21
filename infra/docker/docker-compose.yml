@@ -2,7 +2,7 @@ name: api_integration
 
 services:
   mongo:
-    image: mongo:7
+    image: mongo:latest
     container_name: Mongo
     restart: unless-stopped
     ports:
@@ -14,7 +14,7 @@ services:
       - mongo_data:/data/db
 
   mongo-express:
-    image: mongo-express:1
+    image: mongo-express:latest
     container_name: Mongo-Express
     restart: unless-stopped
     depends_on:
@@ -29,7 +29,7 @@ services:
       ME_CONFIG_BASICAUTH: "false"
 
   pulsar:
-    image: apachepulsar/pulsar:3.3.1
+    image: apachepulsar/pulsar:latest
     container_name: Pulsar-Message-Broker
     restart: unless-stopped
     command: ["bin/pulsar", "standalone"]

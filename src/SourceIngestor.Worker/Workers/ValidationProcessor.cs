@@ -187,9 +187,9 @@ public sealed class ValidationProcessor : BackgroundService
                             { "UserId", userId },
                             { "Id", id },
                             { "Title", title ?? "" },
-                            { "Body", body.AsString } // body is guaranteed non-null here
+                            { "Body", body.AsString ?? "" } // body is guaranteed non-null here
                         };
-
+    
                         validatedItemsArr.Add(validated);
                         validCount++;
                     }
