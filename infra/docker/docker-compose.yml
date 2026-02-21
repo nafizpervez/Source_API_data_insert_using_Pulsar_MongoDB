@@ -2,7 +2,7 @@ name: api_integration
 
 services:
   mongo:
-    image: mongo:latest
+    image: mongo:7
     container_name: Mongo
     restart: unless-stopped
     ports:
@@ -13,40 +13,33 @@ services:
     volumes:
       - mongo_data:/data/db
 
-  mongo-express:
-    image: mongo-express:latest
-    container_name: Mongo-Express
-    restart: unless-stopped
-    depends_on:
-      - mongo
-    ports:
-      - "${MONGO_EXPRESS_PORT:-8081}:8081"
-    environment:
-      ME_CONFIG_MONGODB_ADMINUSERNAME: "${MONGO_INITDB_ROOT_USERNAME}"
-      ME_CONFIG_MONGODB_ADMINPASSWORD: "${MONGO_INITDB_ROOT_PASSWORD}"
-      ME_CONFIG_MONGODB_SERVER: "mongo"
-      ME_CONFIG_MONGODB_PORT: "27017"
-      ME_CONFIG_BASICAUTH: "false"
 
   pulsar:
-    image: apachepulsar/pulsar:latest
+    image: apachepulsar/pulsar:3.3.1
     container_name: Pulsar-Message-Broker
     restart: unless-stopped
     command: ["bin/pulsar", "standalone"]
     ports:
       - "${PULSAR_BROKER_PORT:-6650}:6650"
       - "${PULSAR_HTTP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bin/pulsar-admin namespaces list public >/dev/null 2>&1"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 30
+      start_period: "20s"
     volumes:
       - pulsar_data:/pulsar/data
-      - pulsar_conf:/pulsar/conf
 
   source-ingestor-worker:
     image: dotnet-worker:latest
     container_name: DotNet-Worker
     restart: unless-stopped
     depends_on:
-      - pulsar
-      - mongo
+      pulsar:
+        condition: service_healthy
+      mongo:
+        condition: service_started
     build:
       context: ../..
       dockerfile: src/SourceIngestor.Worker/Dockerfile
@@ -84,4 +77,3 @@ services:
 volumes:
   mongo_data:
   pulsar_data:
-  pulsar_conf:

@@ -35,7 +35,6 @@ docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-fil
 docker rm -f (docker ps -aq)
 ```
 
-
 **Why this command**
 
 - Removes volumes as well, so MongoDB starts fresh on next run
@@ -92,8 +91,8 @@ docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-fil
 - Starts all services in detached mode:
   - Pulsar
   - MongoDB
-  - mongo-express
   - SourceIngestor worker
+  - dozzle
 
 > If you prefer a single command to build + run in one:
 
@@ -167,7 +166,7 @@ docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-fil
 ```
 
 ```powershell
-docker rm -f (docker ps -aq)
+docker compose -p api-integration -f .\infra\docker\docker-compose.yml --env-file .\infra\docker\.env rm -f (docker ps -aq)
 ```
 
 ```powershell
