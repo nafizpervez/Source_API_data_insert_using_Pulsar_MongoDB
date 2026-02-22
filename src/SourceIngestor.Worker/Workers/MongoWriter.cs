@@ -63,9 +63,9 @@ public sealed class MongoWriter : BackgroundService
                     continue;
                 }
 
-                if (string.IsNullOrWhiteSpace(env.JobId) || !ObjectId.TryParse(env.JobId, out var jobObjectId))
+                if (string.IsNullOrWhiteSpace(env.BatchId) || !ObjectId.TryParse(env.BatchId, out var batchObjectId))
                 {
-                    _logger.LogWarning("Missing/invalid JobId in PostsBatchEnvelope. ack + skip. jobId={JobId}", env.JobId);
+                    _logger.LogWarning("Missing/invalid BatchId in PostsBatchEnvelope. ack + skip. batchId={BatchId}", env.BatchId);
                     await consumer.Acknowledge(msg, stoppingToken);
                     continue;
                 }
@@ -93,7 +93,10 @@ public sealed class MongoWriter : BackgroundService
 
                 var doc = new BsonDocument
                 {
-                    { "_id", jobObjectId }, // stable id across Source_Data + audit collections
+                    { "_id", batchObjectId }, // unique per batch (Source_Data)
+                    { "jobId", env.JobId },   // keep correlation for debugging
+                    { "partNo", env.PartNo },
+                    { "totalParts", env.TotalParts },
                     { "sourceUrl", env.SourceUrl },
                     { "fetchedAtLocalText", fetchedAtLocalText },
                     { "timeZoneId", timeZoneDisplay },
@@ -102,12 +105,18 @@ public sealed class MongoWriter : BackgroundService
                     { "payload", items }
                 };
 
-                await col.DeleteManyAsync(FilterDefinition<BsonDocument>.Empty, cancellationToken: stoppingToken);
-                await col.InsertOneAsync(doc, cancellationToken: stoppingToken);
+                // IMPORTANT:
+                // - Do NOT delete the whole collection.
+                // - Upsert by _id for idempotency (in case of redelivery).
+                await col.ReplaceOneAsync(
+                    filter: Builders<BsonDocument>.Filter.Eq("_id", batchObjectId),
+                    replacement: doc,
+                    options: new ReplaceOptions { IsUpsert = true },
+                    cancellationToken: stoppingToken);
 
                 _logger.LogInformation(
-                    "Inserted Source_Data. _id={Id} itemCount={Count} tz={Tz} fetchedAtLocal={FetchedLocal}",
-                    jobObjectId, items.Count, timeZoneDisplay, fetchedAtLocalText);
+                    "Upserted Source_Data batch. _id={Id} jobId={JobId} part={Part}/{Total} itemCount={Count} tz={Tz} fetchedAtLocal={FetchedLocal}",
+                    batchObjectId, env.JobId, env.PartNo, env.TotalParts, items.Count, timeZoneDisplay, fetchedAtLocalText);
 
                 await consumer.Acknowledge(msg, stoppingToken);
             }

@@ -60,7 +60,12 @@ public sealed class SourceCheckProcessor : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("SourceCheckProcessor starting...");
-        _logger.LogInformation("Source URL: {Url}", _api.PostsUrl);
+
+        var sources = ResolveSourceUrls(_api);
+        _logger.LogInformation("Configured source count (non-empty): {Count}", sources.Count);
+        foreach (var s in sources)
+            _logger.LogInformation("Source URL: {Url}", s);
+
         _logger.LogInformation("Pulsar source-check topic: {Topic}", _pulsar.SourceCheckTopic);
         _logger.LogInformation("Pulsar posts-batch topic: {Topic}", _pulsar.PostsBatchTopic);
         _logger.LogInformation("Pulsar DLQ topic (unused for stop-on-fail): {Topic}", _pulsar.DlqTopic);
@@ -88,13 +93,23 @@ public sealed class SourceCheckProcessor : BackgroundService
             .Topic(_pulsar.DlqTopic)
             .Create();
 
-        // Seed 1 job so it runs immediately (Attempt 0 => try 1)
-        var jobId = ObjectId.GenerateNewId().ToString();
-        var seed = new SourceCheckJob(JobId: jobId, Url: _api.PostsUrl, Attempt: 0, CreatedAtUtc: DateTimeOffset.UtcNow);
-        var seedJson = JsonSerializer.Serialize(seed);
-        await checkProducer.Send(seedJson, stoppingToken);
+        // Seed 1 job per valid source so it runs immediately (Attempt 0 => try 1)
+        if (sources.Count == 0)
+        {
+            _logger.LogWarning("No valid SourceApi URLs configured. All entries are empty/null. Processor will idle.");
+        }
+        else
+        {
+            foreach (var url in sources)
+            {
+                var jobId = ObjectId.GenerateNewId().ToString();
+                var seed = new SourceCheckJob(JobId: jobId, Url: url, Attempt: 0, CreatedAtUtc: DateTimeOffset.UtcNow);
+                var seedJson = JsonSerializer.Serialize(seed);
+                await checkProducer.Send(seedJson, stoppingToken);
 
-        _logger.LogInformation("Seeded SourceCheckJob jobId={JobId} (try=1) into {Topic}", jobId, _pulsar.SourceCheckTopic);
+                _logger.LogInformation("Seeded SourceCheckJob jobId={JobId} (try=1) url={Url} into {Topic}", jobId, url, _pulsar.SourceCheckTopic);
+            }
+        }
 
         await foreach (var msg in consumer.Messages(stoppingToken))
         {
@@ -106,6 +121,13 @@ public sealed class SourceCheckProcessor : BackgroundService
                 if (job is null)
                 {
                     _logger.LogWarning("Invalid SourceCheckJob payload. ack+skip. payload={Payload}", payload);
+                    await consumer.Acknowledge(msg, stoppingToken);
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(job.Url))
+                {
+                    _logger.LogWarning("SourceCheckJob has empty url. ack+skip. jobId={JobId}", job.JobId);
                     await consumer.Acknowledge(msg, stoppingToken);
                     continue;
                 }
@@ -137,7 +159,7 @@ public sealed class SourceCheckProcessor : BackgroundService
                     continue;
                 }
 
-                // SUCCESS => publish batch(es) + write audit success doc + NO more retries
+                // SUCCESS => publish batch(es) + write audit success doc PER BATCH + NO more retries
                 _logger.LogInformation(
                     "RESULT jobId={JobId} try={TryNo} url={Url} => VALUE_FOUND status={Status} jsonLen={Len}",
                     job.JobId, tryNo, job.Url, fetch.StatusCode, fetch.RawJson?.Length ?? 0);
@@ -171,6 +193,7 @@ public sealed class SourceCheckProcessor : BackgroundService
 
                 _logger.LogInformation("Chunking source array. totalItems={Total} maxPerBatch={Max}", total, maxPerBatch);
 
+                var totalParts = (int)Math.Ceiling(total / (double)maxPerBatch);
                 var published = 0;
 
                 for (var start = 0; start < total; start += maxPerBatch)
@@ -193,9 +216,18 @@ public sealed class SourceCheckProcessor : BackgroundService
                     using var chunkDoc = JsonDocument.Parse(chunkJson);
                     var chunkPayload = chunkDoc.RootElement.Clone();
 
+                    // IMPORTANT: unique BatchId per chunk => unique Mongo _id per batch doc.
+                    var batchId = ObjectId.GenerateNewId().ToString();
+                    var batchObjectId = ObjectId.Parse(batchId);
+
+                    published++;
+
                     var envelope = new PostsBatchEnvelope
                     {
-                        JobId = job.JobId, // critical: same _id in Source_Data
+                        JobId = job.JobId,
+                        BatchId = batchId,
+                        PartNo = published,
+                        TotalParts = totalParts,
                         SourceUrl = job.Url,
                         FetchedAtUtc = DateTimeOffset.UtcNow,
                         PayloadRawJson = chunkJson,
@@ -206,29 +238,27 @@ public sealed class SourceCheckProcessor : BackgroundService
                     var envJson = JsonSerializer.Serialize(envelope);
                     await batchProducer.Send(envJson, stoppingToken);
 
-                    published++;
-
                     _logger.LogInformation(
-                        "PUBLISHED_BATCH_PART jobId={JobId} url={Url} topic={Topic} try={TryNo} part={Part} start={Start} take={Take}",
-                        job.JobId, job.Url, _pulsar.PostsBatchTopic, tryNo, published, start, take);
+                        "PUBLISHED_BATCH_PART jobId={JobId} batchId={BatchId} url={Url} topic={Topic} try={TryNo} part={Part}/{TotalParts} start={Start} take={Take}",
+                        job.JobId, batchId, job.Url, _pulsar.PostsBatchTopic, tryNo, published, totalParts, start, take);
+
+                    // Write audit success per batch (same _id as Source_Data batch doc)
+                    await WriteSourceOutcomeAsync(
+                        collectionName: _mongo.SourceSuccessIdCollection,
+                        id: batchObjectId,
+                        sourceUrl: job.Url,
+                        fetchedAtLocalText: BuildFetchedAtLocalText(_mongo.TimeZoneId),
+                        timeZoneDisplay: BuildTimeZoneDisplay(_mongo.TimeZoneId),
+                        pulsarText: $"Found With try {tryNo} (jobId={job.JobId}) batch {published}/{totalParts}",
+                        stoppingToken);
                 }
 
                 _logger.LogInformation(
                     "PUBLISHED_BATCH_DONE jobId={JobId} url={Url} totalItems={Total} parts={Parts} maxPerBatch={Max}",
                     job.JobId, job.Url, total, published, maxPerBatch);
 
-                // Write audit success with same ObjectId
-                await WriteSourceOutcomeAsync(
-                    collectionName: _mongo.SourceSuccessIdCollection,
-                    id: jobObjectId,
-                    sourceUrl: job.Url,
-                    fetchedAtLocalText: BuildFetchedAtLocalText(_mongo.TimeZoneId),
-                    timeZoneDisplay: BuildTimeZoneDisplay(_mongo.TimeZoneId),
-                    pulsarText: $"Found With try {tryNo}",
-                    stoppingToken);
-
                 _logger.LogInformation(
-                    "SOURCE_SUCCESS_STOP jobId={JobId} try={TryNo} => wrote {Db}.{Col} and stopping retries.",
+                    "SOURCE_SUCCESS_STOP jobId={JobId} try={TryNo} => wrote {Db}.{Col} per batch and stopping retries.",
                     job.JobId, tryNo, _mongo.Database, _mongo.SourceSuccessIdCollection);
 
                 await consumer.Acknowledge(msg, stoppingToken);
@@ -238,6 +268,25 @@ public sealed class SourceCheckProcessor : BackgroundService
                 _logger.LogError(ex, "SourceCheckProcessor failed. Leaving unacked for redelivery.");
             }
         }
+    }
+
+    private static List<string> ResolveSourceUrls(SourceApiOptions api)
+    {
+        var urls = new List<string>();
+
+        if (api.PostsUrls is { Length: > 0 })
+            urls.AddRange(api.PostsUrls);
+
+        // Backward compatibility: if PostsUrls not set, or set but empty, fall back to PostsUrl
+        if (urls.Count == 0)
+            urls.Add(api.PostsUrl);
+
+        // Skip "" / null / whitespace
+        return urls
+            .Where(u => !string.IsNullOrWhiteSpace(u))
+            .Select(u => u.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     private sealed record FetchResult(
@@ -325,7 +374,7 @@ public sealed class SourceCheckProcessor : BackgroundService
 
             await dlqProducer.Send(dlqPayload, ct);
 
-            // Write audit failed with same ObjectId
+            // Write audit failed with same ObjectId (job-level failure; no batch ids exist)
             await WriteSourceOutcomeAsync(
                 collectionName: _mongo.SourceFailedIdCollection,
                 id: jobObjectId,

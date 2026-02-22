@@ -4,9 +4,16 @@ namespace SourceIngestor.Worker.Messaging.Contracts;
 
 public sealed class PostsBatchEnvelope
 {
-    // Correlation Id across Pulsar + Mongo
-    // This is a Mongo ObjectId string and will be used as _id in Source_Data.
+    // JobId is the correlation id across retries for the same source check job.
+    // This is NOT used as Source_Data _id anymore when chunking into multiple docs.
     public string JobId { get; init; } = string.Empty;
+
+    // BatchId is a Mongo ObjectId string and WILL be used as _id in Source_Data + Source_Success_ID.
+    public string BatchId { get; init; } = string.Empty;
+
+    public int PartNo { get; init; }
+
+    public int TotalParts { get; init; }
 
     public string SourceUrl { get; init; } = string.Empty;
 
