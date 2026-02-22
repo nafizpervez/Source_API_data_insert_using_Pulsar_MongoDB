@@ -1,228 +1,84 @@
-# Ignore Visual Studio files
-*.csproj
-*.sln
-*.userprefs
-*.vspscc
-*.vssscc
-*.suo
-*.pdb
-*.vbproj
-*.vcxproj
-*.vcxproj.filters
-*.dbmdl
-*.disco
-*.ncbproj
-*.opendb
-*.pdbproj
-*.rdlc
-*.sdf
-*.sqlproj
-*.vsmdi
-*.vstemplate
-*.sln.cache
-*.DotSettings
-*local.testsettings
-# Ignore Mono files
-*.exe
+# ----------------------------
+# Build outputs (CRITICAL)
+# ----------------------------
+**/[Bb]in/
+**/[Oo]bj/
+**/[Aa]rtifacts/
+**/[Ll]og/
+**/[Tt]emp/
+**/[Pp]ublish/
+**/[Rr]elease/
+**/[Dd]ebug/
+**/TestResults/
+
+# .NET tooling
 *.dll
+*.exe
 *.pdb
-*.mdb
-*.mdbproj
-*.manifest
-*.mono
-# Ignore NuGet files
-packages/
+*.cache
 *.nupkg
-# Ignore Obj files
-*.obj
+*.snupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
 
-# Ignore Build files
-*.bin
-*.out
+# NuGet packages (optional: keep if you don't vendor packages)
+packages/
 
-# Ignore Resharper files
-*.Resharper
+# ----------------------------
+# Visual Studio
+# ----------------------------
+.vs/
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
 
-# Ignore Test files
-TestResults/
-*.trx
+# Visual Studio Code
+.vscode/
 
-# Ignore Build Tools
-*.BuildToolsVersion.xml
+# Rider / JetBrains
+.idea/
+*.sln.iml
 
-# Ignore ngrok files
-ngrok.yml
-
-# Ignore node_modules
-node_modules/
-
-# Ignore bower_components
-bower_components/
-
-# Ignore temp files
+# MSBuild / temp
 *.tmp
 *.temp
-*.user
-*.suo
-*.db
-Thumbs.db
-ehthumbs.db
-iconcache_*.db
-*.edn
-*.iml
-*.log
-*.msg
-*.oft
-*.opendb
-*.sav
-*.sqlite
-*.sqlite3
-*.sqlite-journal
-*.sublime-project
-*.sublime-workspace
-*.swo
-*.swp
-*.sync
 *.tlog
-*.un~
-*.vsps
-*.vsss
-# Ignore vim swap files
-*.swp
+*.log
 
-# Ignore various OS files
+# ----------------------------
+# DotCover / Coverage
+# ----------------------------
+*.coverage
+*.coveragexml
+*.dotCover
+coverage/
+coverage-report/
+TestResults/
+
+# ----------------------------
+# ASP.NET / IIS Express
+# ----------------------------
+.iisExpress/
+applicationhost.config
+
+
+# ----------------------------
+# Node / frontend (if any)
+# ----------------------------
+node_modules/
+bower_components/
+
+# ----------------------------
+# OS / Editor junk
+# ----------------------------
 .DS_Store
-Desktop.ini
 Thumbs.db
-ehthumbs.db
+Desktop.ini
 Icon?
-*.kdbx
-*.localstorage/
-*.psd1
-*.edb
-*.jrs
-*.lock
-*.log
-*.mab
-*.mb
-*.mdmp
-*.ndx
-*.nrml
-*.obfuscate
-*.opendb
-*.opensdf
-*.pdb
-*.plist
-*.png
-*.pref
-*.preproj
-*.private
-*.propdesc
-*.project
-*.properties
-*.psess
-*.psf
-*.ptres
-*.rbc
-*.rc2
-*.rc3
-*.rdb
-*.regtrans-ms
-*.resmon
-*.resources
-*.resx
-*.ropeproj
-*.sav
-*.scm
-*.searchIndex
-*.setting
-*.settings
-*.shelve
-*.sol
-*.sos
-*.spec
-*.sqlite
-*.sqlite3
-*.sqlite-journal
-*.svclog
-*.svclog1.0.
-*.svclog2.0.
-*.svclog3.0.
-*.tlb
-*.tlh
-*.tlog
-*.userprefs
-*.usertype
-*.utstore
-*.v12.0.userprefs
-*.vss
-*.vstemplate
-*.vsdisco
-*.vsmeta
-*.vssscc
-*.vsssccache
-*.vspscc
-*.vsssccache
-*.wsdlt
-
-# Ignore Eclipse files
-.classpath
-.project
-.settings/
-*.prefs
-*.pydev
-
-# Ignore IntelliJ files
-*.iml
-*.ipr
-*.iws
-*.idea
-*.jar
-*.jpr
-*.js
-*.js.map
-*.kt
-*.log
-*.markdown
-*.module
-*.pl
-*.properties
-*.psd
-*.psd1
-*.psm
-*.psmi
-*.py
-*.pyc
-*.pyo
-*.rb
-*.rbc
-*.rc
-*.res
-*.resx
-*.rs
-*.rst
-*.ru
-*.sbt
-*.scss
-*.sql
-*.sqlite
-*.sqlite3
-*.svnignore
+ehthumbs.db
 *.swp
-*.test
-*.test.js
-*.test.js.map
-*.txt
-*.user
-*.userprefs
-*.vmoptions
-*.vsmeta
-*.vss
-*.vssscc
-*.vsssccache
-*.vspscc
-*.vsssccache
-*.wsdlt
-*.xml
-*.xhtml
-*.yaml
+*.swo

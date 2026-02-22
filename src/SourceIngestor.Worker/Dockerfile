@@ -4,6 +4,7 @@ WORKDIR /src
 COPY . .
 WORKDIR /src/src/SourceIngestor.Worker
 
+RUN dotnet build
 RUN dotnet restore
 RUN dotnet publish -c Release -o /app/publish --no-restore
 
