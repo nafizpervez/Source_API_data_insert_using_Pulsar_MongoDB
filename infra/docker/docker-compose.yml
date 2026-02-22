@@ -2,7 +2,7 @@ name: api_integration
 
 services:
   mongo:
-    image: mongo:7
+    image: mongo:latest
     container_name: Mongo
     restart: unless-stopped
     ports:
@@ -12,29 +12,34 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: "${MONGO_INITDB_ROOT_PASSWORD}"
     volumes:
       - mongo_data:/data/db
+      - mongo_config:/data/configdb
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet -u $${MONGO_INITDB_ROOT_USERNAME} -p $${MONGO_INITDB_ROOT_PASSWORD} --authenticationDatabase admin --eval \"db.runCommand({ ping: 1 }).ok\" | grep 1 >/dev/null 2>&1"]
+      test:
+        [
+          "CMD-SHELL",
+          'mongosh --quiet -u $${MONGO_INITDB_ROOT_USERNAME} -p $${MONGO_INITDB_ROOT_PASSWORD} --authenticationDatabase admin --eval "db.runCommand({ ping: 1 }).ok" | grep 1 >/dev/null 2>&1',
+        ]
       interval: 10s
       timeout: 5s
       retries: 30
       start_period: 20s
 
   pulsar:
-    image: apachepulsar/pulsar:3.3.1
+    image: apachepulsar/pulsar:latest
     container_name: Pulsar-Message-Broker
     restart: unless-stopped
     command: ["bin/pulsar", "standalone"]
     ports:
       - "${PULSAR_BROKER_PORT:-6650}:6650"
       - "${PULSAR_HTTP_PORT:-8080}:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "bin/pulsar-admin namespaces list public >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 20s
     volumes:
       - pulsar_data:/pulsar/data
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/8080'"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 180s
 
   source-ingestor-worker:
     image: dotnet-worker:latest
@@ -62,11 +67,12 @@ services:
       Mongo__InvalidCollection: "Invalid_Data"
       Mongo__TimeZoneId: "${MONGO_TIMEZONE_ID}"
 
-      # If you still use these env vars elsewhere, keep them.
       RETRY_DELAYS_SECONDS: "60,180,540"
       MAX_DELIVERY_ATTEMPTS: "4"
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q \"SourceIngestor.Worker\""]
+      # Confirms the worker process is still running inside the container.
+      # Uses pgrep (present in Debian/Ubuntu-based dotnet images via procps).
+      test: ["CMD-SHELL", "pgrep -f 'SourceIngestor.Worker' >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -85,4 +91,5 @@ services:
 
 volumes:
   mongo_data:
+  mongo_config:
   pulsar_data:

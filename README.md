@@ -206,3 +206,19 @@ This confirms:
 - API fetch succeeded
 - Pulsar publish succeeded
 - Mongo insert succeeded (single batch document containing 100 items)
+
+## 9) Expected Worker Logs (Success Path)
+
+Clone repo from exact commit code Bash command
+
+- To get the entire repo exactly at commit <commit_Code> in one line:
+
+```bash
+git clone <REPO_URL> && cd "$(basename -s .git <REPO_URL>)" && git checkout fad8280<commit_Code>
+```
+
+<commit_Code>
+Here <REPO_URL> & <commit_Code> are:
+
+- `<REPO_URL> replace with http Repo URL`
+- `<commit_Code> replace with http commit code, i.e., fad8280`
