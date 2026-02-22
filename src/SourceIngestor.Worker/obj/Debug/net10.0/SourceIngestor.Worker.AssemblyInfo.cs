@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("SourceIngestor.Worker")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+edc2b2996d2192798e59e66e48f314e9d369bbbe")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+fad8280fcbb77475fcec14b5062711adf4800452")]
 [assembly: System.Reflection.AssemblyProductAttribute("SourceIngestor.Worker")]
 [assembly: System.Reflection.AssemblyTitleAttribute("SourceIngestor.Worker")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

@@ -1876,23 +1876,23 @@
     ]
   },
   "packageFolders": {
-    "C:\\Users\\nafiz\\.nuget\\packages\\": {},
+    "C:\\Users\\ebdeb\\.nuget\\packages\\": {},
     "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages": {}
   },
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "D:\\Source_API_data_insert_using_Pulsar_MongoDB\\src\\SourceIngestor.Worker\\SourceIngestor.Worker.csproj",
+      "projectUniqueName": "D:\\Office_Projects\\API_Integration_Pipeline\\Source_API_data_insert_using_Pulsar_MongoDB\\src\\SourceIngestor.Worker\\SourceIngestor.Worker.csproj",
       "projectName": "SourceIngestor.Worker",
-      "projectPath": "D:\\Source_API_data_insert_using_Pulsar_MongoDB\\src\\SourceIngestor.Worker\\SourceIngestor.Worker.csproj",
-      "packagesPath": "C:\\Users\\nafiz\\.nuget\\packages\\",
-      "outputPath": "D:\\Source_API_data_insert_using_Pulsar_MongoDB\\src\\SourceIngestor.Worker\\obj\\",
+      "projectPath": "D:\\Office_Projects\\API_Integration_Pipeline\\Source_API_data_insert_using_Pulsar_MongoDB\\src\\SourceIngestor.Worker\\SourceIngestor.Worker.csproj",
+      "packagesPath": "C:\\Users\\ebdeb\\.nuget\\packages\\",
+      "outputPath": "D:\\Office_Projects\\API_Integration_Pipeline\\Source_API_data_insert_using_Pulsar_MongoDB\\src\\SourceIngestor.Worker\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
       ],
       "configFilePaths": [
-        "C:\\Users\\nafiz\\AppData\\Roaming\\NuGet\\NuGet.Config",
+        "C:\\Users\\ebdeb\\AppData\\Roaming\\NuGet\\NuGet.Config",
         "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
         "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
       ],
@@ -1901,6 +1901,7 @@
       ],
       "sources": {
         "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
+        "C:\\Program Files\\dotnet\\library-packs": {},
         "https://api.nuget.org/v3/index.json": {}
       },
       "frameworks": {
