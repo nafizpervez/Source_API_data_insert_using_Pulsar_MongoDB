@@ -142,9 +142,15 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
                 if (!feat.TryGetProperty("attributes", out var attrsEl) || attrsEl.ValueKind != JsonValueKind.Object)
                     continue;
 
+                var attrsDoc = BsonDocument.Parse(attrsEl.GetRawText());
+
+                // Convert epoch ms fields to "M/d/yyyy, hh:mm tt" in LOCAL TZ for Mongo snapshot
+                ConvertEpochMsFieldToLocalText(attrsDoc, "created_date", tz);
+                ConvertEpochMsFieldToLocalText(attrsDoc, "last_edited_date", tz);
+
                 var featureDoc = new BsonDocument
                 {
-                    { "attributes", BsonDocument.Parse(attrsEl.GetRawText()) }
+                    { "attributes", attrsDoc }
                 };
 
                 if (_dest.ReturnGeometry &&
@@ -415,6 +421,86 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
             }
 
             return TimeZoneInfo.Local;
+        }
+    }
+
+    private static void ConvertEpochMsFieldToLocalText(BsonDocument attrs, string fieldName, TimeZoneInfo tz)
+    {
+        if (attrs is null || string.IsNullOrWhiteSpace(fieldName))
+            return;
+
+        // case-insensitive find
+        string? actualName = null;
+        BsonValue val = BsonNull.Value;
+
+        foreach (var e in attrs.Elements)
+        {
+            if (string.Equals(e.Name, fieldName, StringComparison.OrdinalIgnoreCase))
+            {
+                actualName = e.Name;
+                val = e.Value;
+                break;
+            }
+        }
+
+        if (actualName is null)
+            return;
+
+        // Already a nice formatted string? keep it.
+        if (val.BsonType == BsonType.String)
+        {
+            var s = (val.AsString ?? "").Trim();
+            if (s.Length == 0) return;
+
+            // If it's numeric string, treat as epoch-ms and convert
+            if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var msStr))
+            {
+                attrs[actualName] = FormatEpochMs(msStr, tz);
+            }
+
+            return;
+        }
+
+        if (!TryReadEpochMs(val, out var ms))
+            return;
+
+        attrs[actualName] = FormatEpochMs(ms, tz);
+    }
+
+    private static bool TryReadEpochMs(BsonValue v, out long ms)
+    {
+        ms = 0;
+
+        try
+        {
+            return v.BsonType switch
+            {
+                BsonType.Int64 => (ms = v.AsInt64) >= 0,
+                BsonType.Int32 => (ms = v.AsInt32) >= 0,
+                BsonType.Double => (ms = Convert.ToInt64(v.AsDouble)) >= 0,
+                BsonType.Decimal128 => (ms = (long)Decimal128.ToDecimal(v.AsDecimal128)) >= 0,
+                BsonType.String when long.TryParse(v.AsString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s)
+                    => (ms = s) >= 0,
+                _ => false
+            };
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string FormatEpochMs(long ms, TimeZoneInfo tz)
+    {
+        try
+        {
+            var utc = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
+            var local = TimeZoneInfo.ConvertTimeFromUtc(utc, tz);
+            return local.ToString("M/d/yyyy, hh:mm tt", CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return "";
         }
     }
 }

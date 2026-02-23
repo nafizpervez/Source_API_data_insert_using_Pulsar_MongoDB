@@ -106,9 +106,10 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         var validPayload = validPayloadVal.AsBsonArray;
         var destPayload = destPayloadVal.AsBsonArray;
 
+        var tz = ResolveTimeZone(_mongo.TimeZoneId);
+
         // IMPORTANT FIX:
         // Build destination index: candidateKey => LIST of destination records for that key
-        // so we can detect updates for "the wrong duplicates" (objectid differs) instead of losing them.
         var destByKey = new Dictionary<string, List<BsonDocument>>(StringComparer.Ordinal);
 
         var destKeysBuilt = 0;            // count of destination FEATURES indexed (not distinct keys)
@@ -151,7 +152,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                 continue;
             }
 
-            // Minimal destination doc (ONLY what we care about + objectid)
+            // Minimal destination doc (ONLY what we care about + objectid) + required metadata fields
             var minimal = new BsonDocument
             {
                 { "objectid", objectIdVal }
@@ -164,6 +165,14 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             minimal["id"] = GetFieldWithCasingFallback(attrs, "id");
             minimal["title"] = GetFieldWithCasingFallback(attrs, "title");
             minimal["body"] = GetFieldWithCasingFallback(attrs, "body");
+
+            // extra metadata from destination
+            minimal["created_user"] = GetFieldWithCasingFallback(attrs, "created_user");
+            minimal["last_edited_user"] = GetFieldWithCasingFallback(attrs, "last_edited_user");
+
+            // dates: already formatted by DestinationRawSyncProcessor, but also handle numeric just in case
+            minimal["created_date"] = FormatDateFieldToLocalText(GetFieldWithCasingFallback(attrs, "created_date"), tz);
+            minimal["last_edited_date"] = FormatDateFieldToLocalText(GetFieldWithCasingFallback(attrs, "last_edited_date"), tz);
 
             // Keep candidate key
             minimal[_dup.ComputedKeyFieldName ?? "Candidate_Key_combination"] = key;
@@ -187,10 +196,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         var updateCount = 0;
         var validSkippedNoKey = 0;
 
-        // avoid duplicate processing for same key from valid payload
         var seenKeys = new HashSet<string>(StringComparer.Ordinal);
-
-        // avoid duplicate output rows (same objectid)
         var seenObjectIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var v in validPayload)
@@ -212,7 +218,6 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                 continue;
             }
 
-            // prevent duplicates from valid payload for the same candidate key
             if (!seenKeys.Add(key))
                 continue;
 
@@ -230,7 +235,6 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             var vBody = GetFieldWithCasingFallback(validDoc, "Body");
             if (vBody.IsBsonNull) vBody = GetFieldWithCasingFallback(validDoc, "body");
 
-            // Compare against EACH destination record for that key
             foreach (var destMin in destList)
             {
                 matchedRecords++;
@@ -248,20 +252,28 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                 if (objectId.IsBsonNull)
                     continue;
 
-                // ensure one output row per objectid
                 var oidKey = NormalizeForCompare(objectId);
                 if (!seenObjectIds.Add(oidKey))
                     continue;
 
-                // Output ONLY required fields (+ objectid to allow update)
+                // Output ONLY required fields (+ objectid to allow update) + requested metadata
                 var outDoc = new BsonDocument
                 {
                     { "objectid", objectId },
                     { "user_id", ChooseValidUserId(validDoc) },
                     { "id", ChooseValidId(validDoc) },
-                    { "title", vTitle.IsBsonNull ? BsonNull.Value : vTitle },
-                    { "body", vBody.IsBsonNull ? BsonNull.Value : vBody },
-                    { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key }
+                    { "final_title", vTitle.IsBsonNull ? BsonNull.Value : vTitle },
+                    { "final_body", vBody.IsBsonNull ? BsonNull.Value : vBody },
+                    { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key },
+
+                    // new fields you requested
+                    { "created_user", destMin.GetValue("created_user", BsonNull.Value) },
+                    { "last_edited_user", destMin.GetValue("last_edited_user", BsonNull.Value) },
+                    { "created_date", destMin.GetValue("created_date", BsonNull.Value) },
+                    { "last_edited_date", destMin.GetValue("last_edited_date", BsonNull.Value) },
+
+                    { "old_title", dTitle.IsBsonNull ? BsonNull.Value : dTitle },
+                    { "old_body", dBody.IsBsonNull ? BsonNull.Value : dBody }
                 };
 
                 updatePayload.Add(outDoc);
@@ -281,8 +293,8 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             { "fetchedAtLocalText", fetchedAtLocalText },
             { "timeZoneId", timeZoneId },
 
-            { "destKeysBuilt", destKeysBuilt },                 // features indexed
-            { "destDistinctKeys", destDistinctKeys },           // unique keys
+            { "destKeysBuilt", destKeysBuilt },
+            { "destDistinctKeys", destDistinctKeys },
             { "destSkippedNoAttrs", destSkippedNoAttrs },
             { "destSkippedNoKey", destSkippedNoKey },
             { "destSkippedNoObjectId", destSkippedNoObjectId },
@@ -499,5 +511,95 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         if (string.IsNullOrWhiteSpace(s)) return s;
         if (s.Length == 1) return s.ToLowerInvariant();
         return char.ToLowerInvariant(s[0]) + s.Substring(1);
+    }
+
+    private static TimeZoneInfo ResolveTimeZone(string? timeZoneId)
+    {
+        if (string.IsNullOrWhiteSpace(timeZoneId))
+            return TimeZoneInfo.Local;
+
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
+        }
+        catch
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Asia/Dhaka"] = "Bangladesh Standard Time",
+                ["Asia/Kuala_Lumpur"] = "Singapore Standard Time",
+                ["Asia/Singapore"] = "Singapore Standard Time"
+            };
+
+            if (map.TryGetValue(timeZoneId, out var windowsId))
+            {
+                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); }
+                catch { }
+            }
+
+            return TimeZoneInfo.Local;
+        }
+    }
+
+    private static BsonValue FormatDateFieldToLocalText(BsonValue v, TimeZoneInfo tz)
+    {
+        if (v is null || v.IsBsonNull)
+            return BsonNull.Value;
+
+        // If already formatted, keep it.
+        if (v.BsonType == BsonType.String)
+        {
+            var s = (v.AsString ?? "").Trim();
+            if (s.Length == 0) return BsonNull.Value;
+
+            // If numeric string -> treat as epoch ms and convert
+            if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var msStr))
+                return new BsonString(FormatEpochMs(msStr, tz));
+
+            return v;
+        }
+
+        if (!TryReadEpochMs(v, out var ms))
+            return v;
+
+        var formatted = FormatEpochMs(ms, tz);
+        return string.IsNullOrWhiteSpace(formatted) ? v : new BsonString(formatted);
+    }
+
+    private static bool TryReadEpochMs(BsonValue v, out long ms)
+    {
+        ms = 0;
+
+        try
+        {
+            return v.BsonType switch
+            {
+                BsonType.Int64 => (ms = v.AsInt64) >= 0,
+                BsonType.Int32 => (ms = v.AsInt32) >= 0,
+                BsonType.Double => (ms = Convert.ToInt64(v.AsDouble)) >= 0,
+                BsonType.Decimal128 => (ms = (long)Decimal128.ToDecimal(v.AsDecimal128)) >= 0,
+                BsonType.String when long.TryParse(v.AsString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s)
+                    => (ms = s) >= 0,
+                _ => false
+            };
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string FormatEpochMs(long ms, TimeZoneInfo tz)
+    {
+        try
+        {
+            var utc = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
+            var local = TimeZoneInfo.ConvertTimeFromUtc(utc, tz);
+            return local.ToString("M/d/yyyy, hh:mm tt", CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return "";
+        }
     }
 }
