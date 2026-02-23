@@ -49,5 +49,8 @@ builder.Services.AddHostedService<ValidationProcessor>();
 // Destination worker remains as-is (we will add Destination_Success_ID / Destination_Failer_ID later)
 builder.Services.AddHostedService<DestinationRawSyncProcessor>();
 
+// NEW: Update detection worker (writes Update_Data snapshot)
+builder.Services.AddHostedService<UpdateDetectionProcessor>();
+
 var host = builder.Build();
 host.Run();

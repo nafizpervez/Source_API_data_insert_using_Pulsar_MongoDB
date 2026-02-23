@@ -51,6 +51,9 @@ public sealed class ValidationProcessor : BackgroundService
         _logger.LogInformation("Duplication computedKeyFieldName: {Field}", _dup.ComputedKeyFieldName);
         _logger.LogInformation("Duplication keyJoiner: '{Joiner}'", _dup.KeyJoiner ?? "");
 
+        // ✅ NEW: Ensure snapshot docs exist immediately (prevents "valid_latest not found yet")
+        await EnsureSnapshotsExist(validatedCol, invalidCol, duplicatedCol, stoppingToken);
+
         // Watermark for this process lifetime
         ObjectId? lastSeenId = null;
 
@@ -325,6 +328,31 @@ public sealed class ValidationProcessor : BackgroundService
         }
     }
 
+    // ✅ NEW: create empty snapshot docs so other workers can read immediately
+    private static async Task EnsureSnapshotsExist(
+        IMongoCollection<BsonDocument> validatedCol,
+        IMongoCollection<BsonDocument> invalidCol,
+        IMongoCollection<BsonDocument> duplicatedCol,
+        CancellationToken ct)
+    {
+        await EnsureOneSnapshotExists(validatedCol, ValidLatestId, ct);
+        await EnsureOneSnapshotExists(invalidCol, InvalidLatestId, ct);
+        await EnsureOneSnapshotExists(duplicatedCol, DuplicatedLatestId, ct);
+    }
+
+    private static async Task EnsureOneSnapshotExists(IMongoCollection<BsonDocument> col, string id, CancellationToken ct)
+    {
+        var filter = Builders<BsonDocument>.Filter.Eq("_id", id);
+
+        var update = Builders<BsonDocument>.Update
+            .SetOnInsert("_id", id)
+            .SetOnInsert("itemCount", 0)
+            .SetOnInsert("payload", new BsonArray())
+            .SetOnInsert("errors", new BsonArray());
+
+        await col.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true }, ct);
+    }
+
     // ---------------------------
     // SNAPSHOT APPEND HELPERS
     // ---------------------------
@@ -532,13 +560,11 @@ public sealed class ValidationProcessor : BackgroundService
                     return v.AsBoolean ? "true" : "false";
 
                 default:
-                    // BsonValue.ToString() is non-null in practice, but guard anyway.
                     return v.ToString() ?? string.Empty;
             }
         }
         catch
         {
-            // Never let key generation crash validation.
             return string.Empty;
         }
     }
@@ -611,7 +637,6 @@ public sealed class ValidationProcessor : BackgroundService
                             return false;
                         }
 
-                        // FLOOR behavior (76.6 -> 76, -76.6 -> -77)
                         var floored = Math.Floor(d);
 
                         if (floored < int.MinValue || floored > int.MaxValue)
@@ -627,8 +652,6 @@ public sealed class ValidationProcessor : BackgroundService
                 case BsonType.Decimal128:
                     {
                         var dec = Decimal128.ToDecimal(v.AsDecimal128);
-
-                        // FLOOR behavior (decimal)
                         var floored = decimal.Floor(dec);
 
                         if (floored < int.MinValue || floored > int.MaxValue)
@@ -645,14 +668,12 @@ public sealed class ValidationProcessor : BackgroundService
                     {
                         var s = v.AsString?.Trim();
 
-                        // Empty string should be INVALID (as you requested)
                         if (string.IsNullOrWhiteSpace(s))
                         {
                             error = "string_empty";
                             return false;
                         }
 
-                        // If it's an integer string: "76"
                         if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var l))
                         {
                             if (l < int.MinValue || l > int.MaxValue)
@@ -664,7 +685,6 @@ public sealed class ValidationProcessor : BackgroundService
                             return true;
                         }
 
-                        // If it's a numeric string: "76.0", "76.6"
                         if (double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var d))
                         {
                             if (double.IsNaN(d) || double.IsInfinity(d))

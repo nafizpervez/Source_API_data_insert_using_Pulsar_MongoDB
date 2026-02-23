@@ -20,6 +20,9 @@ public sealed class MongoOptions
     // Destination raw snapshot collection (ArcGIS FS read)
     public string DestinationRawCollection { get; set; } = "Destination_Raw_Data";
 
+    // NEW: update items snapshot collection (diff output)
+    public string UpdateCollection { get; set; } = "Update_Data";
+
     // NEW: Source API fetch outcome collections (same DB)
     public string SourceSuccessIdCollection { get; set; } = "Source_Success_ID";
     public string SourceFailedIdCollection { get; set; } = "Source_Failed_ID";
