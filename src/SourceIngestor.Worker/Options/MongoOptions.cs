@@ -14,16 +14,19 @@ public sealed class MongoOptions
     // Target collection (invalid items from the batch)
     public string InvalidCollection { get; set; } = "InvalidSourceData";
 
-    // NEW: duplicate items collection (dedup output)
+    // duplicate items collection (dedup output)
     public string DuplicatedCollection { get; set; } = "Duplicated_Data";
 
     // Destination raw snapshot collection (ArcGIS FS read)
     public string DestinationRawCollection { get; set; } = "Destination_Raw_Data";
 
-    // NEW: update items snapshot collection (diff output)
+    // update items snapshot collection (diff output)
     public string UpdateCollection { get; set; } = "Update_Data";
 
-    // NEW: Source API fetch outcome collections (same DB)
+    // NEW: skip items snapshot collection (exact match output)
+    public string SkipCollection { get; set; } = "Skip_Data";
+
+    // Source API fetch outcome collections (same DB)
     public string SourceSuccessIdCollection { get; set; } = "Source_Success_ID";
     public string SourceFailedIdCollection { get; set; } = "Source_Failed_ID";
 

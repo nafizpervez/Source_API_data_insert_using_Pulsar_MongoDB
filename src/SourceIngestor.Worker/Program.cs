@@ -46,11 +46,14 @@ builder.Services.AddHostedService<SourceCheckProcessor>();
 builder.Services.AddHostedService<MongoWriter>();
 builder.Services.AddHostedService<ValidationProcessor>();
 
-// Destination worker remains as-is (we will add Destination_Success_ID / Destination_Failer_ID later)
+// Destination worker remains as-is
 builder.Services.AddHostedService<DestinationRawSyncProcessor>();
 
-// NEW: Update detection worker (writes Update_Data snapshot)
+// Update detection worker
 builder.Services.AddHostedService<UpdateDetectionProcessor>();
+
+// NEW: Skip detection worker (writes Skip_Data snapshot)
+builder.Services.AddHostedService<SkipDetectionProcessor>();
 
 var host = builder.Build();
 host.Run();
