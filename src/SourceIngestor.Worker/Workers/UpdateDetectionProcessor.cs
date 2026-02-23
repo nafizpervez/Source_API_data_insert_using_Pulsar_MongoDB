@@ -71,7 +71,6 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         var validSnap = await validCol.Find(Builders<BsonDocument>.Filter.Eq("_id", ValidLatestId)).FirstOrDefaultAsync(ct);
         var destSnap = await destCol.Find(Builders<BsonDocument>.Filter.Eq("_id", DestinationLatestId)).FirstOrDefaultAsync(ct);
 
-        // Always upsert Update_Data so the collection exists
         if (validSnap is null || destSnap is null)
         {
             var status = validSnap is null && destSnap is null
@@ -107,8 +106,19 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         var validPayload = validPayloadVal.AsBsonArray;
         var destPayload = destPayloadVal.AsBsonArray;
 
-        // Build destination index: key => attributes doc
-        var destByKey = new Dictionary<string, BsonDocument>(StringComparer.Ordinal);
+        // IMPORTANT FIX:
+        // Build destination index: candidateKey => LIST of destination records for that key
+        // so we can detect updates for "the wrong duplicates" (objectid differs) instead of losing them.
+        var destByKey = new Dictionary<string, List<BsonDocument>>(StringComparer.Ordinal);
+
+        var destKeysBuilt = 0;            // count of destination FEATURES indexed (not distinct keys)
+        var destDistinctKeys = 0;         // how many distinct candidate keys exist
+        var destSkippedNoAttrs = 0;
+        var destSkippedNoKey = 0;
+        var destSkippedNoObjectId = 0;
+
+        var oidFieldFromSnap = destSnap.GetValue("objectIdField", "OBJECTID");
+        var oidField = oidFieldFromSnap.IsBsonNull ? "OBJECTID" : (oidFieldFromSnap.ToString() ?? "OBJECTID");
 
         for (var i = 0; i < destPayload.Count; i++)
         {
@@ -118,23 +128,70 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             var featureDoc = destPayload[i].AsBsonDocument;
 
             if (!featureDoc.TryGetValue("attributes", out var attrsVal) || attrsVal.BsonType != BsonType.Document)
+            {
+                destSkippedNoAttrs++;
                 continue;
+            }
 
             var attrs = attrsVal.AsBsonDocument;
 
-            var key = ComputeKeyFromAnyDoc(attrs);
+            var keyRaw = ComputeKeyFromAnyDoc(attrs);
+            var key = NormalizeKey(keyRaw);
             if (string.IsNullOrWhiteSpace(key))
+            {
+                destSkippedNoKey++;
                 continue;
+            }
 
-            destByKey[key] = attrs;
+            // objectid is required to perform update back to ArcGIS
+            var objectIdVal = GetFieldWithCasingFallback(attrs, oidField);
+            if (objectIdVal.IsBsonNull)
+            {
+                destSkippedNoObjectId++;
+                continue;
+            }
+
+            // Minimal destination doc (ONLY what we care about + objectid)
+            var minimal = new BsonDocument
+            {
+                { "objectid", objectIdVal }
+            };
+
+            minimal["user_id"] = GetFieldWithCasingFallback(attrs, "user_id");
+            if (minimal["user_id"].IsBsonNull)
+                minimal["user_id"] = GetFieldWithCasingFallback(attrs, "userId");
+
+            minimal["id"] = GetFieldWithCasingFallback(attrs, "id");
+            minimal["title"] = GetFieldWithCasingFallback(attrs, "title");
+            minimal["body"] = GetFieldWithCasingFallback(attrs, "body");
+
+            // Keep candidate key
+            minimal[_dup.ComputedKeyFieldName ?? "Candidate_Key_combination"] = key;
+
+            if (!destByKey.TryGetValue(key, out var list))
+            {
+                list = new List<BsonDocument>(capacity: 1);
+                destByKey[key] = list;
+                destDistinctKeys++;
+            }
+
+            list.Add(minimal);
+            destKeysBuilt++;
         }
 
-        // Update payload: FULL destination rows patched with Valid_Data title/body
         var updatePayload = new BsonArray();
 
-        var compared = 0;
-        var matched = 0;
+        var comparedKeys = 0;
+        var matchedKeys = 0;             // keys that exist in destination
+        var matchedRecords = 0;          // destination records matched across keys
         var updateCount = 0;
+        var validSkippedNoKey = 0;
+
+        // avoid duplicate processing for same key from valid payload
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+
+        // avoid duplicate output rows (same objectid)
+        var seenObjectIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var v in validPayload)
         {
@@ -143,50 +200,73 @@ public sealed class UpdateDetectionProcessor : BackgroundService
 
             var validDoc = v.AsBsonDocument;
 
-            var key = GetStringCaseInsensitive(validDoc, _dup.ComputedKeyFieldName ?? "");
-            if (string.IsNullOrWhiteSpace(key))
-                key = ComputeKeyFromAnyDoc(validDoc);
+            var keyFromField = GetStringCaseInsensitive(validDoc, _dup.ComputedKeyFieldName ?? "");
+            var key = NormalizeKey(keyFromField);
 
             if (string.IsNullOrWhiteSpace(key))
-                continue;
+                key = NormalizeKey(ComputeKeyFromAnyDoc(validDoc));
 
-            compared++;
-
-            if (!destByKey.TryGetValue(key, out var destAttrs))
-                continue;
-
-            matched++;
-
-            // Compare ONLY title + body
-            var (titleDifferent, bodyDifferent) = TitleBodyDifferent(validDoc, destAttrs);
-
-            if (!titleDifferent && !bodyDifferent)
-                continue;
-
-            // Patch: start from FULL destination attributes
-            var patched = destAttrs.DeepClone().AsBsonDocument;
-
-            if (titleDifferent)
+            if (string.IsNullOrWhiteSpace(key))
             {
-                var newTitle = GetFieldWithCasingFallback(validDoc, "title"); // will find Title or title
-                SetDestinationFieldPreservingCasing(patched, "title", newTitle);
+                validSkippedNoKey++;
+                continue;
             }
 
-            if (bodyDifferent)
+            // prevent duplicates from valid payload for the same candidate key
+            if (!seenKeys.Add(key))
+                continue;
+
+            comparedKeys++;
+
+            if (!destByKey.TryGetValue(key, out var destList) || destList.Count == 0)
+                continue;
+
+            matchedKeys++;
+
+            // Valid title/body
+            var vTitle = GetFieldWithCasingFallback(validDoc, "Title");
+            if (vTitle.IsBsonNull) vTitle = GetFieldWithCasingFallback(validDoc, "title");
+
+            var vBody = GetFieldWithCasingFallback(validDoc, "Body");
+            if (vBody.IsBsonNull) vBody = GetFieldWithCasingFallback(validDoc, "body");
+
+            // Compare against EACH destination record for that key
+            foreach (var destMin in destList)
             {
-                var newBody = GetFieldWithCasingFallback(validDoc, "body"); // will find Body or body
-                SetDestinationFieldPreservingCasing(patched, "body", newBody);
+                matchedRecords++;
+
+                var dTitle = destMin.GetValue("title", BsonNull.Value);
+                var dBody = destMin.GetValue("body", BsonNull.Value);
+
+                var titleDiff = !BsonValuesEqual(vTitle, dTitle);
+                var bodyDiff = !BsonValuesEqual(vBody, dBody);
+
+                if (!titleDiff && !bodyDiff)
+                    continue;
+
+                var objectId = destMin.GetValue("objectid", BsonNull.Value);
+                if (objectId.IsBsonNull)
+                    continue;
+
+                // ensure one output row per objectid
+                var oidKey = NormalizeForCompare(objectId);
+                if (!seenObjectIds.Add(oidKey))
+                    continue;
+
+                // Output ONLY required fields (+ objectid to allow update)
+                var outDoc = new BsonDocument
+                {
+                    { "objectid", objectId },
+                    { "user_id", ChooseValidUserId(validDoc) },
+                    { "id", ChooseValidId(validDoc) },
+                    { "title", vTitle.IsBsonNull ? BsonNull.Value : vTitle },
+                    { "body", vBody.IsBsonNull ? BsonNull.Value : vBody },
+                    { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key }
+                };
+
+                updatePayload.Add(outDoc);
+                updateCount++;
             }
-
-            // Ensure Candidate_Key_combination exists
-            var computed = _dup.ComputedKeyFieldName ?? "Candidate_Key_combination";
-            patched[computed] = key;
-
-            // Ensure candidate key fields exist in the patched output (use destination if present else valid)
-            EnsureCandidateKeys(patched, validDoc);
-
-            updatePayload.Add(patched);
-            updateCount++;
         }
 
         var fetchedAtLocalText = destSnap.GetValue("fetchedAtLocalText", BsonNull.Value);
@@ -200,8 +280,18 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             { "layerUrl", layerUrl },
             { "fetchedAtLocalText", fetchedAtLocalText },
             { "timeZoneId", timeZoneId },
-            { "comparedValidKeys", compared },
-            { "matchedKeys", matched },
+
+            { "destKeysBuilt", destKeysBuilt },                 // features indexed
+            { "destDistinctKeys", destDistinctKeys },           // unique keys
+            { "destSkippedNoAttrs", destSkippedNoAttrs },
+            { "destSkippedNoKey", destSkippedNoKey },
+            { "destSkippedNoObjectId", destSkippedNoObjectId },
+            { "validSkippedNoKey", validSkippedNoKey },
+
+            { "comparedValidKeys", comparedKeys },
+            { "matchedKeys", matchedKeys },
+            { "matchedRecords", matchedRecords },
+
             { "updateCount", updateCount },
             { "itemCount", updatePayload.Count },
             { "payload", updatePayload }
@@ -214,25 +304,31 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             ct);
 
         _logger.LogInformation(
-            "Update_Data snapshot updated. compared={Compared} matched={Matched} updates={Updates} mongo={Db}.{Col} _id={Id}",
-            compared, matched, updateCount, _mongo.Database, _mongo.UpdateCollection, UpdateLatestId);
+            "Update_Data snapshot updated. destKeysBuilt={DestKeysBuilt} destDistinctKeys={DestDistinctKeys} comparedKeys={ComparedKeys} matchedKeys={MatchedKeys} matchedRecords={MatchedRecords} updates={Updates} mongo={Db}.{Col} _id={Id}",
+            destKeysBuilt, destDistinctKeys, comparedKeys, matchedKeys, matchedRecords, updateCount, _mongo.Database, _mongo.UpdateCollection, UpdateLatestId);
     }
 
-    private (bool titleDiff, bool bodyDiff) TitleBodyDifferent(BsonDocument validDoc, BsonDocument destAttrs)
+    private BsonValue ChooseValidUserId(BsonDocument validDoc)
     {
-        var vTitle = GetFieldWithCasingFallback(validDoc, "title");
-        var dTitle = GetFieldWithCasingFallback(destAttrs, "title");
+        var v = GetFieldWithCasingFallback(validDoc, "UserId");
+        if (!v.IsBsonNull) return v;
 
-        var vBody = GetFieldWithCasingFallback(validDoc, "body");
-        var dBody = GetFieldWithCasingFallback(destAttrs, "body");
+        v = GetFieldWithCasingFallback(validDoc, "userId");
+        if (!v.IsBsonNull) return v;
 
-        var titleDiff = !BsonValuesEqual(vTitle, dTitle);
-        var bodyDiff = !BsonValuesEqual(vBody, dBody);
-
-        return (titleDiff, bodyDiff);
+        v = GetFieldWithCasingFallback(validDoc, "user_id");
+        return v;
     }
 
-    // Compute candidate key using Duplication config from ANY doc (Valid or Destination)
+    private BsonValue ChooseValidId(BsonDocument validDoc)
+    {
+        var v = GetFieldWithCasingFallback(validDoc, "Id");
+        if (!v.IsBsonNull) return v;
+
+        v = GetFieldWithCasingFallback(validDoc, "id");
+        return v;
+    }
+
     private string ComputeKeyFromAnyDoc(BsonDocument doc)
     {
         var fields = _dup.CandidateKeyFields ?? Array.Empty<string>();
@@ -257,49 +353,23 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         return string.Join(_dup.KeyJoiner ?? "", parts);
     }
 
-    // Overwrite destination field name with same casing if exists (title vs Title)
-    private static void SetDestinationFieldPreservingCasing(BsonDocument dest, string logicalField, BsonValue newValue)
+    private static string NormalizeKey(string? s)
     {
-        // If destination has exact/case-insensitive match, overwrite that actual field name
-        foreach (var e in dest.Elements)
-        {
-            if (string.Equals(e.Name, logicalField, StringComparison.OrdinalIgnoreCase))
-            {
-                dest[e.Name] = newValue;
-                return;
-            }
-        }
-
-        // If not present, default to logicalField (camel)
-        dest[logicalField] = newValue;
+        if (string.IsNullOrWhiteSpace(s)) return "";
+        return s.Trim();
     }
 
-    private void EnsureCandidateKeys(BsonDocument dest, BsonDocument validDoc)
+    private static string NormalizeFieldName(string s)
     {
-        foreach (var f0 in _dup.CandidateKeyFields ?? Array.Empty<string>())
+        if (string.IsNullOrWhiteSpace(s)) return "";
+        var chars = new List<char>(s.Length);
+        foreach (var ch in s)
         {
-            var f = (f0 ?? "").Trim();
-            if (string.IsNullOrWhiteSpace(f))
-                continue;
-
-            // If destination has it, keep it
-            foreach (var e in dest.Elements)
-            {
-                if (string.Equals(e.Name, f, StringComparison.OrdinalIgnoreCase) && !e.Value.IsBsonNull)
-                    goto next;
-            }
-
-            // Else copy from valid (UserId/Id vs userId/id)
-            var vv = GetFieldWithCasingFallback(validDoc, f);
-            if (!vv.IsBsonNull)
-                dest[f] = vv;
-
-        next:
-            continue;
+            if (char.IsLetterOrDigit(ch))
+                chars.Add(char.ToLowerInvariant(ch));
         }
+        return new string(chars.ToArray());
     }
-
-    // -------- helpers --------
 
     private static string GetStringCaseInsensitive(BsonDocument doc, string fieldName)
     {
@@ -311,7 +381,19 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             if (string.Equals(e.Name, fieldName, StringComparison.OrdinalIgnoreCase))
             {
                 if (e.Value.IsBsonNull) return "";
-                return e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? "");
+                var s = e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? "");
+                return s ?? "";
+            }
+        }
+
+        var target = NormalizeFieldName(fieldName);
+        foreach (var e in doc.Elements)
+        {
+            if (NormalizeFieldName(e.Name) == target)
+            {
+                if (e.Value.IsBsonNull) return "";
+                var s = e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? "");
+                return s ?? "";
             }
         }
 
@@ -320,12 +402,13 @@ public sealed class UpdateDetectionProcessor : BackgroundService
 
     private static BsonValue GetFieldWithCasingFallback(BsonDocument doc, string field)
     {
-        // direct case-insensitive match
+        if (string.IsNullOrWhiteSpace(field))
+            return BsonNull.Value;
+
         foreach (var e in doc.Elements)
             if (string.Equals(e.Name, field, StringComparison.OrdinalIgnoreCase))
                 return e.Value;
 
-        // try Pascal/Camel
         var pas = ToPascalCase(field);
         foreach (var e in doc.Elements)
             if (string.Equals(e.Name, pas, StringComparison.OrdinalIgnoreCase))
@@ -334,6 +417,11 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         var cam = ToCamelCase(field);
         foreach (var e in doc.Elements)
             if (string.Equals(e.Name, cam, StringComparison.OrdinalIgnoreCase))
+                return e.Value;
+
+        var target = NormalizeFieldName(field);
+        foreach (var e in doc.Elements)
+            if (NormalizeFieldName(e.Name) == target)
                 return e.Value;
 
         return BsonNull.Value;

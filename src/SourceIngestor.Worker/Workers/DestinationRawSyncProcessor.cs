@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
@@ -98,9 +97,6 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
         var db = _mongoClient.GetDatabase(_mongo.Database);
         var col = db.GetCollection<BsonDocument>(_mongo.DestinationRawCollection);
 
-        // NOTE: No more DeleteMany/InsertMany per feature.
-        // We keep ONE snapshot document and replace it each run.
-
         var tz = ResolveTimeZone(_mongo.TimeZoneId);
 
         var fetchedUtc = DateTime.UtcNow;
@@ -115,25 +111,21 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
 
         var batchSize = Math.Max(1, _dest.QueryBatchSize);
 
-        // Accumulate ALL features into one payload array (single batch document)
+        // 1) Get ALL ids first (stable and avoids transfer limits / weird paging)
+        var (oidField, objectIds) = await QueryAllObjectIds(layerUrl, token, ct);
+
+        _logger.LogInformation("Destination ids fetched. oidField={OidField} count={Count}", oidField, objectIds.Count);
+
+        // 2) Pull by objectIds in chunks
         var payload = new BsonArray();
-        var resultOffset = 0;
+        var fetchedFeatures = 0;
+        var chunks = 0;
 
-        string oidField = "OBJECTID";
-        var oidResolved = false;
-
-        while (!ct.IsCancellationRequested)
+        foreach (var chunk in Chunk(objectIds, batchSize))
         {
-            var pageRoot = await QueryDestinationPage(layerUrl, token, resultOffset, batchSize, ct);
+            chunks++;
 
-            // Learn OID field name once (nice-to-have metadata inside the batch doc)
-            if (!oidResolved &&
-                pageRoot.TryGetProperty("objectIdFieldName", out var oidEl) &&
-                oidEl.ValueKind == JsonValueKind.String)
-            {
-                oidField = oidEl.GetString() ?? "OBJECTID";
-                oidResolved = true;
-            }
+            var pageRoot = await QueryByObjectIds(layerUrl, token, oidField, chunk, ct);
 
             if (!pageRoot.TryGetProperty("features", out var featuresEl) || featuresEl.ValueKind != JsonValueKind.Array)
             {
@@ -143,13 +135,10 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
 
             var features = featuresEl.EnumerateArray().ToList();
             if (features.Count == 0)
-                break;
+                continue;
 
-            // Convert each feature into a compact BsonDocument and append to payload
-            // IMPORTANT: do NOT include per-feature _id here; this is one batch document.
             foreach (var feat in features)
             {
-                // Expect ArcGIS feature JSON shape: { attributes: {...}, geometry: {...}? }
                 if (!feat.TryGetProperty("attributes", out var attrsEl) || attrsEl.ValueKind != JsonValueKind.Object)
                     continue;
 
@@ -169,45 +158,33 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
                     featureDoc["geometry"] = BsonNull.Value;
                 }
 
-                // Keep the objectId value in the feature doc if present (helps later diffing)
                 if (attrsEl.TryGetProperty(oidField, out var idEl) && TryGetIntLike(idEl, out var idVal))
                     featureDoc["objectId"] = idVal;
 
                 payload.Add(featureDoc);
             }
 
+            fetchedFeatures += features.Count;
+
             _logger.LogInformation(
-                "Destination page fetched. offset={Offset} requested={Requested} received={Received} accumulated={Total}",
-                resultOffset, batchSize, features.Count, payload.Count);
-
-            // Pagination
-            resultOffset += features.Count;
-
-            // Stop when ArcGIS says no more pages
-            var exceeded = pageRoot.TryGetProperty("exceededTransferLimit", out var exEl) &&
-                           exEl.ValueKind == JsonValueKind.True;
-
-            if (!exceeded && features.Count < batchSize)
-                break;
+                "Destination chunk fetched. chunkNo={ChunkNo} requestedIds={Requested} received={Received} accumulated={Total}",
+                chunks, chunk.Count, features.Count, payload.Count);
         }
 
-        // Build one single envelope document (same pattern as Source_Data)
         var envelope = new BsonDocument
         {
-            { "_id", LatestSnapshotId }, // fixed id: always 1 doc
+            { "_id", LatestSnapshotId },
             { "layerUrl", layerUrl },
             { "objectIdField", oidField },
             { "fetchedAtLocalText", fetchedAtLocalText },
             { "timeZoneId", timeZoneDisplay },
-            // { "where", _dest.Where },
-            // { "outFields", _dest.OutFields },
-            // { "returnGeometry", _dest.ReturnGeometry },
             { "batchSize", batchSize },
+            { "idsCount", objectIds.Count },
+            { "featuresFetched", fetchedFeatures },
             { "itemCount", payload.Count },
             { "payload", payload }
         };
 
-        // Replace snapshot atomically (upsert)
         await col.ReplaceOneAsync(
             filter: Builders<BsonDocument>.Filter.Eq("_id", LatestSnapshotId),
             replacement: envelope,
@@ -215,28 +192,20 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
             cancellationToken: ct);
 
         _logger.LogInformation(
-            "Destination snapshot updated. itemCount={Count} mongo={Db}.{Col} _id={Id}",
-            payload.Count, _mongo.Database, _mongo.DestinationRawCollection, LatestSnapshotId);
+            "Destination snapshot updated. idsCount={Ids} itemCount={Count} mongo={Db}.{Col} _id={Id}",
+            objectIds.Count, payload.Count, _mongo.Database, _mongo.DestinationRawCollection, LatestSnapshotId);
     }
 
-    private async Task<JsonElement> QueryDestinationPage(
-        string layerUrl,
-        string token,
-        int resultOffset,
-        int resultRecordCount,
-        CancellationToken ct)
+    private async Task<(string oidField, List<int> objectIds)> QueryAllObjectIds(string layerUrl, string token, CancellationToken ct)
     {
         var http = _httpFactory.CreateClient("arcgis");
 
         var qs = new Dictionary<string, string>
         {
             ["where"] = _dest.Where,
-            ["outFields"] = _dest.OutFields,
-            ["returnGeometry"] = _dest.ReturnGeometry ? "true" : "false",
+            ["returnIdsOnly"] = "true",
             ["f"] = "json",
-            ["token"] = token,
-            ["resultOffset"] = resultOffset.ToString(CultureInfo.InvariantCulture),
-            ["resultRecordCount"] = resultRecordCount.ToString(CultureInfo.InvariantCulture)
+            ["token"] = token
         };
 
         var url = $"{layerUrl}/query?{ToQueryString(qs)}";
@@ -248,20 +217,75 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
         var raw = await res.Content.ReadAsStringAsync(ct);
 
         if (!res.IsSuccessStatusCode)
-            throw new InvalidOperationException($"Destination /query failed. status={(int)res.StatusCode} body={raw}");
+            throw new InvalidOperationException($"Destination returnIdsOnly failed. status={(int)res.StatusCode} body={raw}");
 
         using var doc = JsonDocument.Parse(raw);
         var root = doc.RootElement;
 
         if (root.TryGetProperty("error", out var err))
-            throw new InvalidOperationException($"Destination /query error: {err.GetRawText()}");
+            throw new InvalidOperationException($"Destination returnIdsOnly error: {err.GetRawText()}");
+
+        var oidField = "OBJECTID";
+        if (root.TryGetProperty("objectIdFieldName", out var oidEl) && oidEl.ValueKind == JsonValueKind.String)
+            oidField = oidEl.GetString() ?? "OBJECTID";
+
+        var ids = new List<int>();
+
+        if (root.TryGetProperty("objectIds", out var idsEl) && idsEl.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var el in idsEl.EnumerateArray())
+            {
+                if (TryGetIntLike(el, out var v))
+                    ids.Add(v);
+            }
+        }
+
+        ids.Sort();
+        return (oidField, ids);
+    }
+
+    private async Task<JsonElement> QueryByObjectIds(
+        string layerUrl,
+        string token,
+        string oidField,
+        List<int> objectIds,
+        CancellationToken ct)
+    {
+        var http = _httpFactory.CreateClient("arcgis");
+
+        var qs = new Dictionary<string, string>
+        {
+            ["where"] = _dest.Where,
+            ["objectIds"] = string.Join(",", objectIds),
+            ["outFields"] = _dest.OutFields,
+            ["returnGeometry"] = _dest.ReturnGeometry ? "true" : "false",
+            ["orderByFields"] = oidField,
+            ["f"] = "json",
+            ["token"] = token
+        };
+
+        var url = $"{layerUrl}/query?{ToQueryString(qs)}";
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        ApplyRefererHeader(req);
+
+        using var res = await http.SendAsync(req, ct);
+        var raw = await res.Content.ReadAsStringAsync(ct);
+
+        if (!res.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Destination /query by objectIds failed. status={(int)res.StatusCode} body={raw}");
+
+        using var doc = JsonDocument.Parse(raw);
+        var root = doc.RootElement;
+
+        if (root.TryGetProperty("error", out var err))
+            throw new InvalidOperationException($"Destination /query by objectIds error: {err.GetRawText()}");
 
         return root.Clone();
     }
 
     private async Task<string> GetPortalToken(CancellationToken ct)
     {
-        // refresh token 2 minutes before expiry
         if (!string.IsNullOrWhiteSpace(_token) && _tokenExpiresAtUtc > DateTimeOffset.UtcNow.AddMinutes(2))
             return _token!;
 
@@ -339,6 +363,17 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
         catch
         {
             return false;
+        }
+    }
+
+    private static IEnumerable<List<int>> Chunk(List<int> source, int size)
+    {
+        if (size <= 0) size = 1;
+
+        for (var i = 0; i < source.Count; i += size)
+        {
+            var take = Math.Min(size, source.Count - i);
+            yield return source.GetRange(i, take);
         }
     }
 
