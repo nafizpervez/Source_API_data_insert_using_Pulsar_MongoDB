@@ -1,3 +1,4 @@
+// src/SourceIngestor.Worker/Workers/DestinationRawSyncProcessor.cs
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -111,15 +112,32 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
 
         var batchSize = Math.Max(1, _dest.QueryBatchSize);
 
+        // Run id to correlate batch documents of the same sync cycle
+        var runId = ObjectId.GenerateNewId();
+
         // 1) Get ALL ids first (stable and avoids transfer limits / weird paging)
         var (oidField, objectIds) = await QueryAllObjectIds(layerUrl, token, ct);
 
         _logger.LogInformation("Destination ids fetched. oidField={OidField} count={Count}", oidField, objectIds.Count);
 
-        // 2) Pull by objectIds in chunks
-        var payload = new BsonArray();
-        var fetchedFeatures = 0;
+        // IMPORTANT: We only touch Destination_Raw_Data collection.
+        // Cleanup old batch docs for this layerUrl, keep index doc (LatestSnapshotId) intact.
+        // This prevents infinite growth and ensures the collection reflects the latest sync.
+        var cleanupFilter = Builders<BsonDocument>.Filter.And(
+            Builders<BsonDocument>.Filter.Eq("docType", "batch"),
+            Builders<BsonDocument>.Filter.Eq("layerUrl", layerUrl)
+        );
+
+        var cleanupResult = await col.DeleteManyAsync(cleanupFilter, ct);
+        if (cleanupResult.DeletedCount > 0)
+            _logger.LogInformation("Destination_Raw_Data cleanup removed {Count} old batch documents for layerUrl={LayerUrl}", cleanupResult.DeletedCount, layerUrl);
+
+        // 2) Pull by objectIds in chunks; write each chunk as its own Mongo document
+        var fetchedFeaturesTotal = 0;
         var chunks = 0;
+
+        var batchDocIds = new BsonArray(); // store ObjectIds of batch docs
+        var batchCounts = new List<int>();
 
         foreach (var chunk in Chunk(objectIds, batchSize))
         {
@@ -136,6 +154,8 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
             var features = featuresEl.EnumerateArray().ToList();
             if (features.Count == 0)
                 continue;
+
+            var batchPayload = new BsonArray();
 
             foreach (var feat in features)
             {
@@ -167,39 +187,85 @@ public sealed class DestinationRawSyncProcessor : BackgroundService
                 if (attrsEl.TryGetProperty(oidField, out var idEl) && TryGetIntLike(idEl, out var idVal))
                     featureDoc["objectId"] = idVal;
 
-                payload.Add(featureDoc);
+                batchPayload.Add(featureDoc);
             }
 
-            fetchedFeatures += features.Count;
+            fetchedFeaturesTotal += features.Count;
+
+            // write one Mongo doc per chunk
+            var batchDocId = ObjectId.GenerateNewId();
+
+            // Determine payload range (based on objectIds positions, for easy debugging)
+            var rangeStart = ((chunks - 1) * batchSize);
+            var rangeEnd = Math.Min(rangeStart + batchSize - 1, Math.Max(0, objectIds.Count - 1));
+
+            var batchDoc = new BsonDocument
+            {
+                { "_id", batchDocId },
+                { "docType", "batch" },
+                { "runId", runId },
+                { "layerUrl", layerUrl },
+                { "objectIdField", oidField },
+                { "fetchedAtLocalText", fetchedAtLocalText },
+                { "timeZoneId", timeZoneDisplay },
+
+                { "queryBatchSize", batchSize },
+                { "idsCount", objectIds.Count },
+
+                { "batchNo", chunks },
+                { "batchRange", new BsonDocument { { "startIndex", rangeStart }, { "endIndex", rangeEnd } } },
+                { "requestedObjectIdCount", chunk.Count },
+                { "featuresFetched", features.Count },
+                { "itemCount", batchPayload.Count },
+
+                { "payload", batchPayload }
+            };
+
+            await col.InsertOneAsync(batchDoc, cancellationToken: ct);
+
+            batchDocIds.Add(batchDocId);
+            batchCounts.Add(batchPayload.Count);
 
             _logger.LogInformation(
-                "Destination chunk fetched. chunkNo={ChunkNo} requestedIds={Requested} received={Received} accumulated={Total}",
-                chunks, chunk.Count, features.Count, payload.Count);
+                "Destination batch stored. batchNo={BatchNo} requestedIds={Requested} received={Received} payloadCount={PayloadCount} mongo={Db}.{Col} _id={Id}",
+                chunks, chunk.Count, features.Count, batchPayload.Count, _mongo.Database, _mongo.DestinationRawCollection, batchDocId);
         }
 
-        var envelope = new BsonDocument
+        // 3) Write/replace index doc (destination_raw_latest) WITHOUT payload
+        // This lets other components find the latest run and locate all batch docs.
+        var indexEnvelope = new BsonDocument
         {
             { "_id", LatestSnapshotId },
+            { "docType", "index" },
+            { "status", "ok" },
+
+            { "runId", runId },
             { "layerUrl", layerUrl },
             { "objectIdField", oidField },
             { "fetchedAtLocalText", fetchedAtLocalText },
             { "timeZoneId", timeZoneDisplay },
-            { "batchSize", batchSize },
+
+            { "queryBatchSize", batchSize },
             { "idsCount", objectIds.Count },
-            { "featuresFetched", fetchedFeatures },
-            { "itemCount", payload.Count },
-            { "payload", payload }
+            { "featuresFetched", fetchedFeaturesTotal },
+
+            { "batchCount", batchDocIds.Count },
+            { "batchDocIds", batchDocIds },
+            { "batchItemCounts", new BsonArray(batchCounts) },
+
+            // keep the same field name for backwards visibility (but NOT storing everything here)
+            { "itemCount", fetchedFeaturesTotal }
         };
 
         await col.ReplaceOneAsync(
             filter: Builders<BsonDocument>.Filter.Eq("_id", LatestSnapshotId),
-            replacement: envelope,
+            replacement: indexEnvelope,
             options: new ReplaceOptions { IsUpsert = true },
             cancellationToken: ct);
 
         _logger.LogInformation(
-            "Destination snapshot updated. idsCount={Ids} itemCount={Count} mongo={Db}.{Col} _id={Id}",
-            objectIds.Count, payload.Count, _mongo.Database, _mongo.DestinationRawCollection, LatestSnapshotId);
+            "Destination index updated. idsCount={Ids} featuresFetched={Fetched} batches={Batches} mongo={Db}.{Col} _id={Id}",
+            objectIds.Count, fetchedFeaturesTotal, batchDocIds.Count, _mongo.Database, _mongo.DestinationRawCollection, LatestSnapshotId);
     }
 
     private async Task<(string oidField, List<int> objectIds)> QueryAllObjectIds(string layerUrl, string token, CancellationToken ct)

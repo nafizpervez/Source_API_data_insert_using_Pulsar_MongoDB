@@ -9,8 +9,8 @@ public sealed class DestinationApiOptions
     public bool ReturnGeometry { get; set; } = false;
 
     // Query in batches of OBJECTIDs to avoid maxRecordCount limits
-    public int QueryBatchSize { get; set; } = 500;
+    public int QueryBatchSize { get; set; }
 
     // Run interval for syncing destination raw data
-    public int SyncIntervalSeconds { get; set; } = 600;
+    public int SyncIntervalSeconds { get; set; }
 }
