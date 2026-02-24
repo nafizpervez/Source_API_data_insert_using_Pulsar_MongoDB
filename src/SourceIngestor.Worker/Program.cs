@@ -52,8 +52,14 @@ builder.Services.AddHostedService<DestinationRawSyncProcessor>();
 // Update detection worker
 builder.Services.AddHostedService<UpdateDetectionProcessor>();
 
-// NEW: Skip detection worker (writes Skip_Data snapshot)
+// Skip detection worker (writes Skip_Data snapshot)
 builder.Services.AddHostedService<SkipDetectionProcessor>();
+
+// Delete detection worker (writes Delete_Data snapshot)
+builder.Services.AddHostedService<DeleteDetectionProcessor>();
+
+// NEW: Insert detection worker (writes Insert_Data snapshot)
+builder.Services.AddHostedService<InsertDetectionProcessor>();
 
 var host = builder.Build();
 host.Run();

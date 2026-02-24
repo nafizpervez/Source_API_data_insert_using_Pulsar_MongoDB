@@ -23,8 +23,14 @@ public sealed class MongoOptions
     // update items snapshot collection (diff output)
     public string UpdateCollection { get; set; } = "Update_Data";
 
-    // NEW: skip items snapshot collection (exact match output)
+    // skip items snapshot collection (exact match output)
     public string SkipCollection { get; set; } = "Skip_Data";
+
+    // delete items snapshot collection (exists in destination but NOT in source)
+    public string DeleteCollection { get; set; } = "Delete_Data";
+
+    // NEW: insert items snapshot collection (exists in source but NOT in destination)
+    public string InsertCollection { get; set; } = "Insert_Data";
 
     // Source API fetch outcome collections (same DB)
     public string SourceSuccessIdCollection { get; set; } = "Source_Success_ID";
