@@ -36,7 +36,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
     {
         _logger.LogInformation("UpdateDetectionProcessor started.");
         _logger.LogInformation("Valid snapshot: {Col} _id={Id}", _mongo.ValidatedCollection, ValidLatestId);
-        _logger.LogInformation("Destination snapshot: {Col} _id={Id}", _mongo.DestinationRawCollection, DestinationLatestId);
+        _logger.LogInformation("Destination snapshot (index): {Col} _id={Id}", _mongo.DestinationRawCollection, DestinationLatestId);
         _logger.LogInformation("Update snapshot: {Col} _id={Id}", _mongo.UpdateCollection, UpdateLatestId);
 
         var interval = TimeSpan.FromSeconds(Math.Max(10, _dest.SyncIntervalSeconds));
@@ -49,7 +49,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             }
             catch (TaskCanceledException)
             {
-                // shutdown
+                // shutting down
             }
             catch (Exception ex)
             {
@@ -69,11 +69,11 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         var updateCol = db.GetCollection<BsonDocument>(_mongo.UpdateCollection);
 
         var validSnap = await validCol.Find(Builders<BsonDocument>.Filter.Eq("_id", ValidLatestId)).FirstOrDefaultAsync(ct);
-        var destSnap = await destCol.Find(Builders<BsonDocument>.Filter.Eq("_id", DestinationLatestId)).FirstOrDefaultAsync(ct);
+        var destIndexOrOld = await destCol.Find(Builders<BsonDocument>.Filter.Eq("_id", DestinationLatestId)).FirstOrDefaultAsync(ct);
 
-        if (validSnap is null || destSnap is null)
+        if (validSnap is null || destIndexOrOld is null)
         {
-            var status = validSnap is null && destSnap is null
+            var status = validSnap is null && destIndexOrOld is null
                 ? "waiting_for_valid_latest_and_destination_latest"
                 : validSnap is null
                     ? "waiting_for_valid_latest"
@@ -100,26 +100,48 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         if (!validSnap.TryGetValue("payload", out var validPayloadVal) || validPayloadVal.BsonType != BsonType.Array)
             return;
 
-        if (!destSnap.TryGetValue("payload", out var destPayloadVal) || destPayloadVal.BsonType != BsonType.Array)
+        // ✅ IMPORTANT:
+        // DestinationRawSyncProcessor now stores destination in batch docs and an index doc.
+        // So here we always rebuild a single in-memory destination payload list.
+        var destLoad = await LoadDestinationPayloadAsync(destCol, destIndexOrOld, ct);
+        if (!destLoad.Success)
+        {
+            _logger.LogWarning("UpdateDetectionProcessor: destination payload could not be loaded. reason={Reason}", destLoad.Reason);
+
+            var envelopeMissing = new BsonDocument
+            {
+                { "_id", UpdateLatestId },
+                { "status", "waiting_for_destination_payload" },
+                { "reason", destLoad.Reason },
+                { "updateCount", 0 },
+                { "itemCount", 0 },
+                { "payload", new BsonArray() }
+            };
+
+            await updateCol.ReplaceOneAsync(
+                Builders<BsonDocument>.Filter.Eq("_id", UpdateLatestId),
+                envelopeMissing,
+                new ReplaceOptions { IsUpsert = true },
+                ct);
+
             return;
+        }
 
         var validPayload = validPayloadVal.AsBsonArray;
-        var destPayload = destPayloadVal.AsBsonArray;
+        var destPayload = destLoad.Payload;
 
         var tz = ResolveTimeZone(_mongo.TimeZoneId);
 
-        // IMPORTANT FIX:
         // Build destination index: candidateKey => LIST of destination records for that key
         var destByKey = new Dictionary<string, List<BsonDocument>>(StringComparer.Ordinal);
 
         var destKeysBuilt = 0;            // count of destination FEATURES indexed (not distinct keys)
-        var destDistinctKeys = 0;         // how many distinct candidate keys exist
+        var destDistinctKeys = 0;         // distinct candidate keys
         var destSkippedNoAttrs = 0;
         var destSkippedNoKey = 0;
         var destSkippedNoObjectId = 0;
 
-        var oidFieldFromSnap = destSnap.GetValue("objectIdField", "OBJECTID");
-        var oidField = oidFieldFromSnap.IsBsonNull ? "OBJECTID" : (oidFieldFromSnap.ToString() ?? "OBJECTID");
+        var oidField = string.IsNullOrWhiteSpace(destLoad.ObjectIdField) ? "OBJECTID" : destLoad.ObjectIdField;
 
         for (var i = 0; i < destPayload.Count; i++)
         {
@@ -144,7 +166,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                 continue;
             }
 
-            // objectid is required to perform update back to ArcGIS
+            // objectid is required for updates back to ArcGIS
             var objectIdVal = GetFieldWithCasingFallback(attrs, oidField);
             if (objectIdVal.IsBsonNull)
             {
@@ -152,7 +174,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                 continue;
             }
 
-            // Minimal destination doc (ONLY what we care about + objectid) + required metadata fields
+            // Minimal destination doc
             var minimal = new BsonDocument
             {
                 { "objectid", objectIdVal }
@@ -166,15 +188,13 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             minimal["title"] = GetFieldWithCasingFallback(attrs, "title");
             minimal["body"] = GetFieldWithCasingFallback(attrs, "body");
 
-            // extra metadata from destination
+            // keep destination metadata for reporting
             minimal["created_user"] = GetFieldWithCasingFallback(attrs, "created_user");
             minimal["last_edited_user"] = GetFieldWithCasingFallback(attrs, "last_edited_user");
 
-            // dates: already formatted by DestinationRawSyncProcessor, but also handle numeric just in case
             minimal["created_date"] = FormatDateFieldToLocalText(GetFieldWithCasingFallback(attrs, "created_date"), tz);
             minimal["last_edited_date"] = FormatDateFieldToLocalText(GetFieldWithCasingFallback(attrs, "last_edited_date"), tz);
 
-            // Keep candidate key
             minimal[_dup.ComputedKeyFieldName ?? "Candidate_Key_combination"] = key;
 
             if (!destByKey.TryGetValue(key, out var list))
@@ -191,12 +211,15 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         var updatePayload = new BsonArray();
 
         var comparedKeys = 0;
-        var matchedKeys = 0;             // keys that exist in destination
-        var matchedRecords = 0;          // destination records matched across keys
+        var matchedKeys = 0;
+        var matchedRecords = 0;
         var updateCount = 0;
         var validSkippedNoKey = 0;
 
+        // only compare each candidate key once from Valid_Data
         var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+
+        // prevent duplicate output rows by objectid
         var seenObjectIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var v in validPayload)
@@ -228,7 +251,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
 
             matchedKeys++;
 
-            // Valid title/body
+            // Valid title/body (source)
             var vTitle = GetFieldWithCasingFallback(validDoc, "Title");
             if (vTitle.IsBsonNull) vTitle = GetFieldWithCasingFallback(validDoc, "title");
 
@@ -245,6 +268,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                 var titleDiff = !BsonValuesEqual(vTitle, dTitle);
                 var bodyDiff = !BsonValuesEqual(vBody, dBody);
 
+                // only update when something changed
                 if (!titleDiff && !bodyDiff)
                     continue;
 
@@ -256,7 +280,6 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                 if (!seenObjectIds.Add(oidKey))
                     continue;
 
-                // Output ONLY required fields (+ objectid to allow update) + requested metadata
                 var outDoc = new BsonDocument
                 {
                     { "objectid", objectId },
@@ -266,7 +289,6 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                     { "final_body", vBody.IsBsonNull ? BsonNull.Value : vBody },
                     { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key },
 
-                    // new fields you requested
                     { "created_user", destMin.GetValue("created_user", BsonNull.Value) },
                     { "last_edited_user", destMin.GetValue("last_edited_user", BsonNull.Value) },
                     { "created_date", destMin.GetValue("created_date", BsonNull.Value) },
@@ -281,17 +303,14 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             }
         }
 
-        var fetchedAtLocalText = destSnap.GetValue("fetchedAtLocalText", BsonNull.Value);
-        var timeZoneId = destSnap.GetValue("timeZoneId", BsonNull.Value);
-        var layerUrl = destSnap.GetValue("layerUrl", BsonNull.Value);
-
         var envelope = new BsonDocument
         {
             { "_id", UpdateLatestId },
             { "status", "ok" },
-            { "layerUrl", layerUrl },
-            { "fetchedAtLocalText", fetchedAtLocalText },
-            { "timeZoneId", timeZoneId },
+
+            { "layerUrl", destLoad.LayerUrl ?? BsonNull.Value },
+            { "fetchedAtLocalText", destLoad.FetchedAtLocalText ?? BsonNull.Value },
+            { "timeZoneId", destLoad.TimeZoneId ?? BsonNull.Value },
 
             { "destKeysBuilt", destKeysBuilt },
             { "destDistinctKeys", destDistinctKeys },
@@ -319,6 +338,93 @@ public sealed class UpdateDetectionProcessor : BackgroundService
             "Update_Data snapshot updated. destKeysBuilt={DestKeysBuilt} destDistinctKeys={DestDistinctKeys} comparedKeys={ComparedKeys} matchedKeys={MatchedKeys} matchedRecords={MatchedRecords} updates={Updates} mongo={Db}.{Col} _id={Id}",
             destKeysBuilt, destDistinctKeys, comparedKeys, matchedKeys, matchedRecords, updateCount, _mongo.Database, _mongo.UpdateCollection, UpdateLatestId);
     }
+
+    // ------------------------------------------------------------
+    // Destination payload loader (supports both old + new storage)
+    // ------------------------------------------------------------
+
+    private sealed record DestinationLoadResult(
+        bool Success,
+        string Reason,
+        BsonArray Payload,
+        string ObjectIdField,
+        BsonValue? LayerUrl,
+        BsonValue? FetchedAtLocalText,
+        BsonValue? TimeZoneId);
+
+    private static bool IsIndexDoc(BsonDocument doc)
+    {
+        if (!doc.TryGetValue("docType", out var v)) return false;
+        return v.BsonType == BsonType.String && string.Equals(v.AsString, "index", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<DestinationLoadResult> LoadDestinationPayloadAsync(
+        IMongoCollection<BsonDocument> destCol,
+        BsonDocument destIndexOrOld,
+        CancellationToken ct)
+    {
+        // Old mode: destination_raw_latest had payload directly
+        if (!IsIndexDoc(destIndexOrOld))
+        {
+            if (destIndexOrOld.TryGetValue("payload", out var p) && p.BsonType == BsonType.Array)
+            {
+                var oidFieldOld = destIndexOrOld.GetValue("objectIdField", "OBJECTID").ToString() ?? "OBJECTID";
+                return new DestinationLoadResult(true, "ok_old_format", p.AsBsonArray, oidFieldOld,
+                    destIndexOrOld.GetValue("layerUrl", BsonNull.Value),
+                    destIndexOrOld.GetValue("fetchedAtLocalText", BsonNull.Value),
+                    destIndexOrOld.GetValue("timeZoneId", BsonNull.Value));
+            }
+
+            return new DestinationLoadResult(false, "old_format_missing_payload", new BsonArray(), "OBJECTID", null, null, null);
+        }
+
+        // New mode: index doc + batch docs
+        var oidField = destIndexOrOld.GetValue("objectIdField", "OBJECTID").ToString() ?? "OBJECTID";
+
+        if (!destIndexOrOld.TryGetValue("batchDocIds", out var idsVal) || idsVal.BsonType != BsonType.Array)
+            return new DestinationLoadResult(false, "index_missing_batchDocIds", new BsonArray(), oidField, null, null, null);
+
+        var idsArr = idsVal.AsBsonArray;
+        if (idsArr.Count == 0)
+            return new DestinationLoadResult(true, "index_has_no_batches", new BsonArray(), oidField,
+                destIndexOrOld.GetValue("layerUrl", BsonNull.Value),
+                destIndexOrOld.GetValue("fetchedAtLocalText", BsonNull.Value),
+                destIndexOrOld.GetValue("timeZoneId", BsonNull.Value));
+
+        var objectIds = new List<ObjectId>(idsArr.Count);
+        foreach (var v in idsArr)
+        {
+            if (v.BsonType == BsonType.ObjectId)
+                objectIds.Add(v.AsObjectId);
+        }
+
+        if (objectIds.Count == 0)
+            return new DestinationLoadResult(false, "index_batchDocIds_not_objectIds", new BsonArray(), oidField, null, null, null);
+
+        var filter = Builders<BsonDocument>.Filter.In("_id", objectIds);
+
+        // Pull all batches and merge their payloads
+        var batchDocs = await destCol.Find(filter).ToListAsync(ct);
+
+        var merged = new BsonArray();
+        foreach (var b in batchDocs)
+        {
+            if (!b.TryGetValue("payload", out var pv) || pv.BsonType != BsonType.Array)
+                continue;
+
+            foreach (var item in pv.AsBsonArray)
+                merged.Add(item);
+        }
+
+        return new DestinationLoadResult(true, "ok_index_format", merged, oidField,
+            destIndexOrOld.GetValue("layerUrl", BsonNull.Value),
+            destIndexOrOld.GetValue("fetchedAtLocalText", BsonNull.Value),
+            destIndexOrOld.GetValue("timeZoneId", BsonNull.Value));
+    }
+
+    // ------------------------------------------------------------
+    // The rest of your original helper methods (unchanged)
+    // ------------------------------------------------------------
 
     private BsonValue ChooseValidUserId(BsonDocument validDoc)
     {
@@ -546,13 +652,11 @@ public sealed class UpdateDetectionProcessor : BackgroundService
         if (v is null || v.IsBsonNull)
             return BsonNull.Value;
 
-        // If already formatted, keep it.
         if (v.BsonType == BsonType.String)
         {
             var s = (v.AsString ?? "").Trim();
             if (s.Length == 0) return BsonNull.Value;
 
-            // If numeric string -> treat as epoch ms and convert
             if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var msStr))
                 return new BsonString(FormatEpochMs(msStr, tz));
 
@@ -578,8 +682,7 @@ public sealed class UpdateDetectionProcessor : BackgroundService
                 BsonType.Int32 => (ms = v.AsInt32) >= 0,
                 BsonType.Double => (ms = Convert.ToInt64(v.AsDouble)) >= 0,
                 BsonType.Decimal128 => (ms = (long)Decimal128.ToDecimal(v.AsDecimal128)) >= 0,
-                BsonType.String when long.TryParse(v.AsString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s)
-                    => (ms = s) >= 0,
+                BsonType.String when long.TryParse(v.AsString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) => (ms = s) >= 0,
                 _ => false
             };
         }

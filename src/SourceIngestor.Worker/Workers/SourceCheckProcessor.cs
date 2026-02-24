@@ -16,15 +16,17 @@ namespace SourceIngestor.Worker.Workers;
 
 public sealed class SourceCheckProcessor : BackgroundService
 {
-    // Max 3 tries total:
-    // Attempt 0 => try 1 (immediate)
-    // Attempt 1 => try 2 (+1m)
-    // Attempt 2 => try 3 (+3m)
-    // After that => STOP + mark Failed
+    // Retry plan (total 4 tries):
+    // - Try 1: immediately (Attempt = 0)
+    // - Try 2: after 1 minute (Attempt = 1)
+    // - Try 3: after 3 minutes (Attempt = 2)
+    // - Try 4: after 9 minutes (Attempt = 3)
+    // If try 4 also fails -> push to DLQ + write to Source_Failed_ID and STOP.
     private static readonly TimeSpan[] RetryDelays =
     [
-        TimeSpan.FromMinutes(1), // attempt 1
-        TimeSpan.FromMinutes(3)  // attempt 2
+        TimeSpan.FromMinutes(1), // Attempt 1 => Try 2
+        TimeSpan.FromMinutes(3), // Attempt 2 => Try 3
+        TimeSpan.FromMinutes(9)  // Attempt 3 => Try 4
     ];
 
     private readonly IPulsarClient _pulsarClient;
@@ -68,7 +70,7 @@ public sealed class SourceCheckProcessor : BackgroundService
 
         _logger.LogInformation("Pulsar source-check topic: {Topic}", _pulsar.SourceCheckTopic);
         _logger.LogInformation("Pulsar posts-batch topic: {Topic}", _pulsar.PostsBatchTopic);
-        _logger.LogInformation("Pulsar DLQ topic (unused for stop-on-fail): {Topic}", _pulsar.DlqTopic);
+        _logger.LogInformation("Pulsar DLQ topic: {Topic}", _pulsar.DlqTopic);
 
         _logger.LogInformation("Mongo audit success collection: {Db}.{Col}", _mongo.Database, _mongo.SourceSuccessIdCollection);
         _logger.LogInformation("Mongo audit failed collection: {Db}.{Col}", _mongo.Database, _mongo.SourceFailedIdCollection);
@@ -87,13 +89,12 @@ public sealed class SourceCheckProcessor : BackgroundService
             .Topic(_pulsar.PostsBatchTopic)
             .Create();
 
-        // We keep DLQ producer for compatibility/logging, but per your new requirement
-        // we will STOP after try 3 and write Source_Failed_ID instead of continuing retries.
+        // DLQ producer is used only when we finally give up after try 4.
         await using var dlqProducer = _pulsarClient.NewProducer(Schema.String)
             .Topic(_pulsar.DlqTopic)
             .Create();
 
-        // Seed 1 job per valid source so it runs immediately (Attempt 0 => try 1)
+        // Seed one job per valid source URL so it starts immediately (Try 1)
         if (sources.Count == 0)
         {
             _logger.LogWarning("No valid SourceApi URLs configured. All entries are empty/null. Processor will idle.");
@@ -104,8 +105,7 @@ public sealed class SourceCheckProcessor : BackgroundService
             {
                 var jobId = ObjectId.GenerateNewId().ToString();
                 var seed = new SourceCheckJob(JobId: jobId, Url: url, Attempt: 0, CreatedAtUtc: DateTimeOffset.UtcNow);
-                var seedJson = JsonSerializer.Serialize(seed);
-                await checkProducer.Send(seedJson, stoppingToken);
+                await checkProducer.Send(JsonSerializer.Serialize(seed), stoppingToken);
 
                 _logger.LogInformation("Seeded SourceCheckJob jobId={JobId} (try=1) url={Url} into {Topic}", jobId, url, _pulsar.SourceCheckTopic);
             }
@@ -150,16 +150,15 @@ public sealed class SourceCheckProcessor : BackgroundService
                 if (!fetch.Success)
                 {
                     _logger.LogWarning(
-                        "RESULT jobId={JobId} try={TryNo} url={Url} => NOT_FOUND/DOWN status={Status} reason={Reason}",
+                        "RESULT jobId={JobId} try={TryNo} url={Url} => DOWN status={Status} reason={Reason}",
                         job.JobId, tryNo, job.Url, fetch.StatusCode, fetch.Reason);
 
                     await ScheduleRetryOrStop(job, jobObjectId, checkProducer, dlqProducer, fetch, stoppingToken);
-
                     await consumer.Acknowledge(msg, stoppingToken);
                     continue;
                 }
 
-                // SUCCESS => publish batch(es) + write audit success doc PER BATCH + NO more retries
+                // SUCCESS => publish batch(es) + write audit success doc PER BATCH + NO more retries for this job
                 _logger.LogInformation(
                     "RESULT jobId={JobId} try={TryNo} url={Url} => VALUE_FOUND status={Status} jsonLen={Len}",
                     job.JobId, tryNo, job.Url, fetch.StatusCode, fetch.RawJson?.Length ?? 0);
@@ -235,8 +234,7 @@ public sealed class SourceCheckProcessor : BackgroundService
                         payload = chunkPayload
                     };
 
-                    var envJson = JsonSerializer.Serialize(envelope);
-                    await batchProducer.Send(envJson, stoppingToken);
+                    await batchProducer.Send(JsonSerializer.Serialize(envelope), stoppingToken);
 
                     _logger.LogInformation(
                         "PUBLISHED_BATCH_PART jobId={JobId} batchId={BatchId} url={Url} topic={Topic} try={TryNo} part={Part}/{TotalParts} start={Start} take={Take}",
@@ -281,7 +279,6 @@ public sealed class SourceCheckProcessor : BackgroundService
         if (urls.Count == 0)
             urls.Add(api.PostsUrl);
 
-        // Skip "" / null / whitespace
         return urls
             .Where(u => !string.IsNullOrWhiteSpace(u))
             .Select(u => u.Trim())
@@ -306,9 +303,7 @@ public sealed class SourceCheckProcessor : BackgroundService
             using var res = await http.SendAsync(req, ct);
 
             if (!res.IsSuccessStatusCode)
-            {
                 return new FetchResult(false, res.StatusCode, null, "non_success_status");
-            }
 
             var raw = await res.Content.ReadAsStringAsync(ct);
 
@@ -348,45 +343,50 @@ public sealed class SourceCheckProcessor : BackgroundService
     {
         var nextAttempt = job.Attempt + 1;
 
-        // With RetryDelays length=2:
-        // attempts allowed: 0,1,2 (tries 1,2,3)
-        // if nextAttempt > 2 => this would become attempt 3 (try 4) => STOP + FAILED
+        // RetryDelays has 3 entries => Attempt allowed: 0..3 => Try allowed: 1..4
+        // If we go beyond that => STOP + DLQ + Failed audit.
         if (nextAttempt > RetryDelays.Length)
         {
-            var tryNo = job.Attempt + 1;
+            var lastTryNo = job.Attempt + 1; // this is the try that just failed (1..4)
 
             _logger.LogError(
                 "SOURCE_FAILED_STOP jobId={JobId} lastTry={TryNo} reason={FetchReason} lastStatus={Status}",
-                job.JobId, tryNo, fetch.Reason, fetch.StatusCode);
+                job.JobId, lastTryNo, fetch.Reason, fetch.StatusCode);
 
-            // Optional: also publish to DLQ topic for visibility (but STOP retries anyway)
+            // For debugging: record the exact retry schedule + where we stopped.
+            var retryScheduleMinutes = RetryDelays.Select(d => (int)Math.Round(d.TotalMinutes)).ToArray();
+            var lastDelayMinutes = retryScheduleMinutes.Length > 0 ? retryScheduleMinutes[^1] : 0;
+
             var dlqPayload = JsonSerializer.Serialize(new
             {
                 job.JobId,
                 job.Url,
                 attempt = job.Attempt,
+                tryNo = lastTryNo,
+                retryScheduleMinutes,
+                lastDelayMinutes,
                 createdAtUtc = job.CreatedAtUtc,
                 failedAtUtc = DateTimeOffset.UtcNow,
                 lastStatus = fetch.StatusCode?.ToString(),
                 lastReason = fetch.Reason,
-                reason = "DTQ Raised - Service Unavailable (stopped after try 3)"
+                reason = "DTQ Raised - Service Unavailable (stopped after try 4)"
             });
 
             await dlqProducer.Send(dlqPayload, ct);
 
-            // Write audit failed with same ObjectId (job-level failure; no batch ids exist)
             await WriteSourceOutcomeAsync(
                 collectionName: _mongo.SourceFailedIdCollection,
                 id: jobObjectId,
                 sourceUrl: job.Url,
                 fetchedAtLocalText: BuildFetchedAtLocalText(_mongo.TimeZoneId),
                 timeZoneDisplay: BuildTimeZoneDisplay(_mongo.TimeZoneId),
-                pulsarText: "DTQ Raised - Service Unavailable",
+                pulsarText: $"DTQ Raised - Service Unavailable | stoppedAfterTry={lastTryNo} | schedule={string.Join(",", retryScheduleMinutes)}m | lastStatus={fetch.StatusCode} | lastReason={fetch.Reason}",
                 ct);
 
             return;
         }
 
+        // Otherwise schedule the next retry based on the retry array.
         var delay = RetryDelays[nextAttempt - 1];
         var deliverAtUtc = DateTimeOffset.UtcNow.Add(delay);
 

@@ -10,7 +10,6 @@ public sealed class DeleteDetectionProcessor : BackgroundService
 {
     private const string ValidLatestId = "valid_latest";
     private const string DestinationLatestId = "destination_raw_latest";
-
     private const string DeleteLatestId = "delete_latest";
 
     private readonly IMongoClient _mongoClient;
@@ -37,7 +36,7 @@ public sealed class DeleteDetectionProcessor : BackgroundService
     {
         _logger.LogInformation("DeleteDetectionProcessor started.");
         _logger.LogInformation("Valid snapshot: {Col} _id={Id}", _mongo.ValidatedCollection, ValidLatestId);
-        _logger.LogInformation("Destination snapshot: {Col} _id={Id}", _mongo.DestinationRawCollection, DestinationLatestId);
+        _logger.LogInformation("Destination snapshot (index): {Col} _id={Id}", _mongo.DestinationRawCollection, DestinationLatestId);
         _logger.LogInformation("Delete snapshot: {Col} _id={Id}", _mongo.DeleteCollection, DeleteLatestId);
 
         var interval = TimeSpan.FromSeconds(Math.Max(10, _dest.SyncIntervalSeconds));
@@ -70,11 +69,11 @@ public sealed class DeleteDetectionProcessor : BackgroundService
         var deleteCol = db.GetCollection<BsonDocument>(_mongo.DeleteCollection);
 
         var validSnap = await validCol.Find(Builders<BsonDocument>.Filter.Eq("_id", ValidLatestId)).FirstOrDefaultAsync(ct);
-        var destSnap = await destCol.Find(Builders<BsonDocument>.Filter.Eq("_id", DestinationLatestId)).FirstOrDefaultAsync(ct);
+        var destIndexOrOld = await destCol.Find(Builders<BsonDocument>.Filter.Eq("_id", DestinationLatestId)).FirstOrDefaultAsync(ct);
 
-        if (validSnap is null || destSnap is null)
+        if (validSnap is null || destIndexOrOld is null)
         {
-            var status = validSnap is null && destSnap is null
+            var status = validSnap is null && destIndexOrOld is null
                 ? "waiting_for_valid_latest_and_destination_latest"
                 : validSnap is null
                     ? "waiting_for_valid_latest"
@@ -101,15 +100,37 @@ public sealed class DeleteDetectionProcessor : BackgroundService
         if (!validSnap.TryGetValue("payload", out var validPayloadVal) || validPayloadVal.BsonType != BsonType.Array)
             return;
 
-        if (!destSnap.TryGetValue("payload", out var destPayloadVal) || destPayloadVal.BsonType != BsonType.Array)
+        // ✅ Load destination payload from index+batch docs (or old single payload doc)
+        var destLoad = await LoadDestinationPayloadAsync(destCol, destIndexOrOld, ct);
+        if (!destLoad.Success)
+        {
+            _logger.LogWarning("DeleteDetectionProcessor: destination payload could not be loaded. reason={Reason}", destLoad.Reason);
+
+            var envelopeMissing = new BsonDocument
+            {
+                { "_id", DeleteLatestId },
+                { "status", "waiting_for_destination_payload" },
+                { "reason", destLoad.Reason },
+                { "deleteCount", 0 },
+                { "itemCount", 0 },
+                { "payload", new BsonArray() }
+            };
+
+            await deleteCol.ReplaceOneAsync(
+                Builders<BsonDocument>.Filter.Eq("_id", DeleteLatestId),
+                envelopeMissing,
+                new ReplaceOptions { IsUpsert = true },
+                ct);
+
             return;
+        }
 
         var validPayload = validPayloadVal.AsBsonArray;
-        var destPayload = destPayloadVal.AsBsonArray;
+        var destPayload = destLoad.Payload;
 
         var tz = ResolveTimeZone(_mongo.TimeZoneId);
 
-        // 1) Build SOURCE key set (what SHOULD exist)
+        // 1) Build SOURCE key set (what should exist)
         var sourceKeySet = new HashSet<string>(StringComparer.Ordinal);
         var sourceKeysBuilt = 0;
         var sourceSkippedNoKey = 0;
@@ -137,17 +158,16 @@ public sealed class DeleteDetectionProcessor : BackgroundService
                 sourceKeysBuilt++;
         }
 
-        // 2) Index DESTINATION by key (what CURRENTLY exists)
+        // 2) Index DESTINATION by key (what currently exists)
         var destByKey = new Dictionary<string, List<BsonDocument>>(StringComparer.Ordinal);
 
-        var destKeysBuilt = 0;           // destination FEATURES indexed
-        var destDistinctKeys = 0;        // unique keys
+        var destKeysBuilt = 0;
+        var destDistinctKeys = 0;
         var destSkippedNoAttrs = 0;
         var destSkippedNoKey = 0;
         var destSkippedNoObjectId = 0;
 
-        var oidFieldFromSnap = destSnap.GetValue("objectIdField", "OBJECTID");
-        var oidField = oidFieldFromSnap.IsBsonNull ? "OBJECTID" : (oidFieldFromSnap.ToString() ?? "OBJECTID");
+        var oidField = string.IsNullOrWhiteSpace(destLoad.ObjectIdField) ? "OBJECTID" : destLoad.ObjectIdField;
 
         for (var i = 0; i < destPayload.Count; i++)
         {
@@ -179,7 +199,6 @@ public sealed class DeleteDetectionProcessor : BackgroundService
                 continue;
             }
 
-            // minimal destination doc for delete payload
             var minimal = new BsonDocument
             {
                 { "objectid", objectIdVal }
@@ -193,7 +212,6 @@ public sealed class DeleteDetectionProcessor : BackgroundService
             minimal["title"] = GetFieldWithCasingFallback(attrs, "title");
             minimal["body"] = GetFieldWithCasingFallback(attrs, "body");
 
-            // metadata fields required in Delete_Data payload
             minimal["created_user"] = GetFieldWithCasingFallback(attrs, "created_user");
             minimal["last_edited_user"] = GetFieldWithCasingFallback(attrs, "last_edited_user");
             minimal["created_date"] = FormatDateFieldToLocalText(GetFieldWithCasingFallback(attrs, "created_date"), tz);
@@ -212,16 +230,14 @@ public sealed class DeleteDetectionProcessor : BackgroundService
             destKeysBuilt++;
         }
 
-        // 3) Delete keys = destination keys that do NOT exist in sourceKeySet
+        // 3) Delete = destination keys that do NOT exist in sourceKeySet
         var deletePayload = new BsonArray();
         var deleteCount = 0;
 
-        // prevent duplicate output rows (same objectid)
         var seenObjectIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var (key, destList) in destByKey)
         {
-            // If key exists in source => should NOT be deleted
             if (sourceKeySet.Contains(key))
                 continue;
 
@@ -255,17 +271,14 @@ public sealed class DeleteDetectionProcessor : BackgroundService
             }
         }
 
-        var fetchedAtLocalText = destSnap.GetValue("fetchedAtLocalText", BsonNull.Value);
-        var timeZoneId = destSnap.GetValue("timeZoneId", BsonNull.Value);
-        var layerUrl = destSnap.GetValue("layerUrl", BsonNull.Value);
-
         var envelope = new BsonDocument
         {
             { "_id", DeleteLatestId },
             { "status", "ok" },
-            { "layerUrl", layerUrl },
-            { "fetchedAtLocalText", fetchedAtLocalText },
-            { "timeZoneId", timeZoneId },
+
+            { "layerUrl", destLoad.LayerUrl ?? BsonNull.Value },
+            { "fetchedAtLocalText", destLoad.FetchedAtLocalText ?? BsonNull.Value },
+            { "timeZoneId", destLoad.TimeZoneId ?? BsonNull.Value },
 
             { "sourceDistinctKeys", sourceKeysBuilt },
             { "sourceSkippedNoKey", sourceSkippedNoKey },
@@ -291,6 +304,87 @@ public sealed class DeleteDetectionProcessor : BackgroundService
             "Delete_Data snapshot updated. sourceDistinctKeys={SourceDistinctKeys} destKeysBuilt={DestKeysBuilt} destDistinctKeys={DestDistinctKeys} deleteCount={DeleteCount} mongo={Db}.{Col} _id={Id}",
             sourceKeysBuilt, destKeysBuilt, destDistinctKeys, deleteCount, _mongo.Database, _mongo.DeleteCollection, DeleteLatestId);
     }
+
+    // ------------------------------------------------------------
+    // Destination payload loader (supports old + new storage)
+    // ------------------------------------------------------------
+
+    private sealed record DestinationLoadResult(
+        bool Success,
+        string Reason,
+        BsonArray Payload,
+        string ObjectIdField,
+        BsonValue? LayerUrl,
+        BsonValue? FetchedAtLocalText,
+        BsonValue? TimeZoneId);
+
+    private static bool IsIndexDoc(BsonDocument doc)
+    {
+        if (!doc.TryGetValue("docType", out var v)) return false;
+        return v.BsonType == BsonType.String && string.Equals(v.AsString, "index", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<DestinationLoadResult> LoadDestinationPayloadAsync(
+        IMongoCollection<BsonDocument> destCol,
+        BsonDocument destIndexOrOld,
+        CancellationToken ct)
+    {
+        if (!IsIndexDoc(destIndexOrOld))
+        {
+            if (destIndexOrOld.TryGetValue("payload", out var p) && p.BsonType == BsonType.Array)
+            {
+                var oidFieldOld = destIndexOrOld.GetValue("objectIdField", "OBJECTID").ToString() ?? "OBJECTID";
+                return new DestinationLoadResult(true, "ok_old_format", p.AsBsonArray, oidFieldOld,
+                    destIndexOrOld.GetValue("layerUrl", BsonNull.Value),
+                    destIndexOrOld.GetValue("fetchedAtLocalText", BsonNull.Value),
+                    destIndexOrOld.GetValue("timeZoneId", BsonNull.Value));
+            }
+
+            return new DestinationLoadResult(false, "old_format_missing_payload", new BsonArray(), "OBJECTID", null, null, null);
+        }
+
+        var oidField = destIndexOrOld.GetValue("objectIdField", "OBJECTID").ToString() ?? "OBJECTID";
+
+        if (!destIndexOrOld.TryGetValue("batchDocIds", out var idsVal) || idsVal.BsonType != BsonType.Array)
+            return new DestinationLoadResult(false, "index_missing_batchDocIds", new BsonArray(), oidField, null, null, null);
+
+        var idsArr = idsVal.AsBsonArray;
+        if (idsArr.Count == 0)
+            return new DestinationLoadResult(true, "index_has_no_batches", new BsonArray(), oidField,
+                destIndexOrOld.GetValue("layerUrl", BsonNull.Value),
+                destIndexOrOld.GetValue("fetchedAtLocalText", BsonNull.Value),
+                destIndexOrOld.GetValue("timeZoneId", BsonNull.Value));
+
+        var objectIds = new List<ObjectId>(idsArr.Count);
+        foreach (var v in idsArr)
+            if (v.BsonType == BsonType.ObjectId)
+                objectIds.Add(v.AsObjectId);
+
+        if (objectIds.Count == 0)
+            return new DestinationLoadResult(false, "index_batchDocIds_not_objectIds", new BsonArray(), oidField, null, null, null);
+
+        var filter = Builders<BsonDocument>.Filter.In("_id", objectIds);
+        var batchDocs = await destCol.Find(filter).ToListAsync(ct);
+
+        var merged = new BsonArray();
+        foreach (var b in batchDocs)
+        {
+            if (!b.TryGetValue("payload", out var pv) || pv.BsonType != BsonType.Array)
+                continue;
+
+            foreach (var item in pv.AsBsonArray)
+                merged.Add(item);
+        }
+
+        return new DestinationLoadResult(true, "ok_index_format", merged, oidField,
+            destIndexOrOld.GetValue("layerUrl", BsonNull.Value),
+            destIndexOrOld.GetValue("fetchedAtLocalText", BsonNull.Value),
+            destIndexOrOld.GetValue("timeZoneId", BsonNull.Value));
+    }
+
+    // ------------------------------------------------------------
+    // Original helper methods (unchanged)
+    // ------------------------------------------------------------
 
     private string ComputeKeyFromAnyDoc(BsonDocument doc)
     {
@@ -514,8 +608,7 @@ public sealed class DeleteDetectionProcessor : BackgroundService
                 BsonType.Int32 => (ms = v.AsInt32) >= 0,
                 BsonType.Double => (ms = Convert.ToInt64(v.AsDouble)) >= 0,
                 BsonType.Decimal128 => (ms = (long)Decimal128.ToDecimal(v.AsDecimal128)) >= 0,
-                BsonType.String when long.TryParse(v.AsString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s)
-                    => (ms = s) >= 0,
+                BsonType.String when long.TryParse(v.AsString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) => (ms = s) >= 0,
                 _ => false
             };
         }

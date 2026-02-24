@@ -58,8 +58,11 @@ builder.Services.AddHostedService<SkipDetectionProcessor>();
 // Delete detection worker (writes Delete_Data snapshot)
 builder.Services.AddHostedService<DeleteDetectionProcessor>();
 
-// NEW: Insert detection worker (writes Insert_Data snapshot)
+// Insert detection worker (writes Insert_Data snapshot)
 builder.Services.AddHostedService<InsertDetectionProcessor>();
+
+// NEW: Apply changes to Destination Feature Service + write Final_Destination_Data + audit success/fail
+builder.Services.AddHostedService<DestinationCheckProcessor>();
 
 var host = builder.Build();
 host.Run();

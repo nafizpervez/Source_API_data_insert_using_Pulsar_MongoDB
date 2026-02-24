@@ -1,4 +1,7 @@
+// src/SourceIngestor.Worker/Workers/SkipDetectionProcessor.cs
 using System.Globalization;
+using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -6,31 +9,52 @@ using SourceIngestor.Worker.Options;
 
 namespace SourceIngestor.Worker.Workers;
 
+/// <summary>
+/// SkipDetectionProcessor builds Skip_Data snapshot:
+/// - "Skip" means: the record exists in Destination Feature Service AND matches Valid_Data exactly (user_id, id, title, body)
+/// - Also: if a key appears in Update_Data, we DO NOT allow it to be in Skip_Data (your rule).
+///
+/// IMPORTANT CHANGE (per your request):
+/// - Destination data is read DIRECTLY from the Destination Feature Service (live),
+///   not from Mongo Destination_Raw_Data snapshot.
+/// </summary>
 public sealed class SkipDetectionProcessor : BackgroundService
 {
     private const string ValidLatestId = "valid_latest";
-    private const string DestinationLatestId = "destination_raw_latest";
     private const string UpdateLatestId = "update_latest";
-
     private const string SkipLatestId = "skip_latest";
 
+    private readonly IHttpClientFactory _httpFactory;
     private readonly IMongoClient _mongoClient;
+
     private readonly MongoOptions _mongo;
-    private readonly DuplicationOptions _dup;
+    private readonly ArcGisPortalOptions _portal;
     private readonly DestinationApiOptions _dest;
+    private readonly DuplicationOptions _dup;
+
     private readonly ILogger<SkipDetectionProcessor> _logger;
 
+    // Token cache (avoid spamming generateToken)
+    private string? _token;
+    private DateTimeOffset _tokenExpiresAtUtc = DateTimeOffset.MinValue;
+
     public SkipDetectionProcessor(
+        IHttpClientFactory httpFactory,
         IMongoClient mongoClient,
         IOptions<MongoOptions> mongo,
-        IOptions<DuplicationOptions> dup,
+        IOptions<ArcGisPortalOptions> portal,
         IOptions<DestinationApiOptions> dest,
+        IOptions<DuplicationOptions> dup,
         ILogger<SkipDetectionProcessor> logger)
     {
+        _httpFactory = httpFactory;
         _mongoClient = mongoClient;
+
         _mongo = mongo.Value;
-        _dup = dup.Value;
+        _portal = portal.Value;
         _dest = dest.Value;
+        _dup = dup.Value;
+
         _logger = logger;
     }
 
@@ -38,9 +62,9 @@ public sealed class SkipDetectionProcessor : BackgroundService
     {
         _logger.LogInformation("SkipDetectionProcessor started.");
         _logger.LogInformation("Valid snapshot: {Col} _id={Id}", _mongo.ValidatedCollection, ValidLatestId);
-        _logger.LogInformation("Destination snapshot: {Col} _id={Id}", _mongo.DestinationRawCollection, DestinationLatestId);
         _logger.LogInformation("Update snapshot: {Col} _id={Id}", _mongo.UpdateCollection, UpdateLatestId);
         _logger.LogInformation("Skip snapshot: {Col} _id={Id}", _mongo.SkipCollection, SkipLatestId);
+        _logger.LogInformation("Destination Feature Service (LIVE): {Url}", _dest.FeatureLayerUrl);
 
         var interval = TimeSpan.FromSeconds(Math.Max(10, _dest.SyncIntervalSeconds));
 
@@ -52,7 +76,7 @@ public sealed class SkipDetectionProcessor : BackgroundService
             }
             catch (TaskCanceledException)
             {
-                // shutdown
+                // normal shutdown
             }
             catch (Exception ex)
             {
@@ -68,52 +92,29 @@ public sealed class SkipDetectionProcessor : BackgroundService
         var db = _mongoClient.GetDatabase(_mongo.Database);
 
         var validCol = db.GetCollection<BsonDocument>(_mongo.ValidatedCollection);
-        var destCol = db.GetCollection<BsonDocument>(_mongo.DestinationRawCollection);
         var updateCol = db.GetCollection<BsonDocument>(_mongo.UpdateCollection);
         var skipCol = db.GetCollection<BsonDocument>(_mongo.SkipCollection);
 
         var validSnap = await validCol.Find(Builders<BsonDocument>.Filter.Eq("_id", ValidLatestId)).FirstOrDefaultAsync(ct);
-        var destSnap = await destCol.Find(Builders<BsonDocument>.Filter.Eq("_id", DestinationLatestId)).FirstOrDefaultAsync(ct);
         var updateSnap = await updateCol.Find(Builders<BsonDocument>.Filter.Eq("_id", UpdateLatestId)).FirstOrDefaultAsync(ct);
 
-        if (validSnap is null || destSnap is null)
+        if (validSnap is null)
         {
-            var status = validSnap is null && destSnap is null
-                ? "waiting_for_valid_latest_and_destination_latest"
-                : validSnap is null
-                    ? "waiting_for_valid_latest"
-                    : "waiting_for_destination_latest";
-
-            var envelopeMissing = new BsonDocument
-            {
-                { "_id", SkipLatestId },
-                { "status", status },
-                { "skipCount", 0 },
-                { "itemCount", 0 },
-                { "payload", new BsonArray() }
-            };
-
-            await skipCol.ReplaceOneAsync(
-                Builders<BsonDocument>.Filter.Eq("_id", SkipLatestId),
-                envelopeMissing,
-                new ReplaceOptions { IsUpsert = true },
-                ct);
-
+            // Valid_Data not ready yet
+            await WriteWaiting(skipCol, "waiting_for_valid_latest", "Valid_Data snapshot not found yet.", ct);
             return;
         }
 
         if (!validSnap.TryGetValue("payload", out var validPayloadVal) || validPayloadVal.BsonType != BsonType.Array)
+        {
+            await WriteWaiting(skipCol, "waiting_for_valid_payload", "Valid_Data payload missing/not array.", ct);
             return;
+        }
 
-        if (!destSnap.TryGetValue("payload", out var destPayloadVal) || destPayloadVal.BsonType != BsonType.Array)
-            return;
+        if (string.IsNullOrWhiteSpace(_dest.FeatureLayerUrl))
+            throw new InvalidOperationException("DestinationApi.FeatureLayerUrl is empty.");
 
-        var validPayload = validPayloadVal.AsBsonArray;
-        var destPayload = destPayloadVal.AsBsonArray;
-
-        var tz = ResolveTimeZone(_mongo.TimeZoneId);
-
-        // Build update-key set for Rule #2 (deduct)
+        // Build Update key set (anything in Update_Data cannot be in Skip_Data)
         var updateKeySet = new HashSet<string>(StringComparer.Ordinal);
         if (updateSnap is not null &&
             updateSnap.TryGetValue("payload", out var updatePayloadVal) &&
@@ -131,79 +132,81 @@ public sealed class SkipDetectionProcessor : BackgroundService
             }
         }
 
-        // Index destination by CandidateKey -> list of destination minimal docs
+        // Read LIVE destination data (FeatureService)
+        var token = await GetPortalToken(ct);
+        var layerUrl = _dest.FeatureLayerUrl.TrimEnd('/');
+
+        var (oidField, objectIds) = await QueryAllObjectIds(layerUrl, token, ct);
+
+        var batchSize = Math.Max(1, _dest.QueryBatchSize);
+
+        // Index destination by candidate key => list of minimal docs
         var destByKey = new Dictionary<string, List<BsonDocument>>(StringComparer.Ordinal);
 
-        var destKeysBuilt = 0;
-        var destDistinctKeys = 0;
+        var destKeysBuilt = 0;          // distinct keys
+        var destRecordsBuilt = 0;       // total records indexed
         var destSkippedNoAttrs = 0;
         var destSkippedNoKey = 0;
         var destSkippedNoObjectId = 0;
 
-        var oidFieldFromSnap = destSnap.GetValue("objectIdField", "OBJECTID");
-        var oidField = oidFieldFromSnap.IsBsonNull ? "OBJECTID" : (oidFieldFromSnap.ToString() ?? "OBJECTID");
-
-        for (var i = 0; i < destPayload.Count; i++)
+        foreach (var chunk in Chunk(objectIds, batchSize))
         {
-            if (destPayload[i].BsonType != BsonType.Document)
-                continue;
+            var pageRoot = await QueryByObjectIds(layerUrl, token, oidField, chunk, ct);
 
-            var featureDoc = destPayload[i].AsBsonDocument;
+            if (!pageRoot.TryGetProperty("features", out var featuresEl) || featuresEl.ValueKind != JsonValueKind.Array)
+                break;
 
-            if (!featureDoc.TryGetValue("attributes", out var attrsVal) || attrsVal.BsonType != BsonType.Document)
+            foreach (var feat in featuresEl.EnumerateArray())
             {
-                destSkippedNoAttrs++;
-                continue;
+                if (!feat.TryGetProperty("attributes", out var attrsEl) || attrsEl.ValueKind != JsonValueKind.Object)
+                {
+                    destSkippedNoAttrs++;
+                    continue;
+                }
+
+                var attrs = BsonDocument.Parse(attrsEl.GetRawText());
+
+                // Candidate key from destination attributes
+                var keyRaw = ComputeKeyFromAnyDoc(attrs);
+                var key = NormalizeKey(keyRaw);
+                if (string.IsNullOrWhiteSpace(key))
+                {
+                    destSkippedNoKey++;
+                    continue;
+                }
+
+                // Need OBJECTID to track unique destination record
+                var objectIdVal = GetFieldWithCasingFallback(attrs, oidField);
+                if (objectIdVal.IsBsonNull)
+                {
+                    destSkippedNoObjectId++;
+                    continue;
+                }
+
+                var minimal = new BsonDocument
+                {
+                    { "objectid", objectIdVal },
+                    { "user_id", GetFieldWithCasingFallback(attrs, "user_id").IsBsonNull ? GetFieldWithCasingFallback(attrs, "userId") : GetFieldWithCasingFallback(attrs, "user_id") },
+                    { "id", GetFieldWithCasingFallback(attrs, "id") },
+                    { "title", GetFieldWithCasingFallback(attrs, "title") },
+                    { "body", GetFieldWithCasingFallback(attrs, "body") },
+                    { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key }
+                };
+
+                if (!destByKey.TryGetValue(key, out var list))
+                {
+                    list = new List<BsonDocument>(capacity: 1);
+                    destByKey[key] = list;
+                    destKeysBuilt++;
+                }
+
+                list.Add(minimal);
+                destRecordsBuilt++;
             }
-
-            var attrs = attrsVal.AsBsonDocument;
-
-            var keyRaw = ComputeKeyFromAnyDoc(attrs);
-            var key = NormalizeKey(keyRaw);
-            if (string.IsNullOrWhiteSpace(key))
-            {
-                destSkippedNoKey++;
-                continue;
-            }
-
-            var objectIdVal = GetFieldWithCasingFallback(attrs, oidField);
-            if (objectIdVal.IsBsonNull)
-            {
-                destSkippedNoObjectId++;
-                continue;
-            }
-
-            var minimal = new BsonDocument
-            {
-                { "objectid", objectIdVal }
-            };
-
-            minimal["user_id"] = GetFieldWithCasingFallback(attrs, "user_id");
-            if (minimal["user_id"].IsBsonNull)
-                minimal["user_id"] = GetFieldWithCasingFallback(attrs, "userId");
-
-            minimal["id"] = GetFieldWithCasingFallback(attrs, "id");
-            minimal["title"] = GetFieldWithCasingFallback(attrs, "title");
-            minimal["body"] = GetFieldWithCasingFallback(attrs, "body");
-
-            // metadata fields required in Skip_Data payload
-            minimal["created_user"] = GetFieldWithCasingFallback(attrs, "created_user");
-            minimal["last_edited_user"] = GetFieldWithCasingFallback(attrs, "last_edited_user");
-            minimal["created_date"] = FormatDateFieldToLocalText(GetFieldWithCasingFallback(attrs, "created_date"), tz);
-            minimal["last_edited_date"] = FormatDateFieldToLocalText(GetFieldWithCasingFallback(attrs, "last_edited_date"), tz);
-
-            minimal[_dup.ComputedKeyFieldName ?? "Candidate_Key_combination"] = key;
-
-            if (!destByKey.TryGetValue(key, out var list))
-            {
-                list = new List<BsonDocument>(capacity: 1);
-                destByKey[key] = list;
-                destDistinctKeys++;
-            }
-
-            list.Add(minimal);
-            destKeysBuilt++;
         }
+
+        // Compare Valid_Data vs Destination FS for exact match => Skip_Data
+        var validPayload = validPayloadVal.AsBsonArray;
 
         var skipPayload = new BsonArray();
 
@@ -224,6 +227,7 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
             var validDoc = v.AsBsonDocument;
 
+            // Candidate key from Valid_Data
             var keyFromField = GetStringCaseInsensitive(validDoc, _dup.ComputedKeyFieldName ?? "");
             var key = NormalizeKey(keyFromField);
 
@@ -246,11 +250,11 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
             matchedKeys++;
 
-            // If key appears in Update_Data, then it must NOT be in Skip_Data (Rule #2)
+            // Rule: if in Update_Data => do NOT include in Skip_Data
             if (updateKeySet.Contains(key))
                 continue;
 
-            // Valid fields (source)
+            // Valid fields (source-of-truth)
             var vUserId = ChooseValidUserId(validDoc);
             var vId = ChooseValidId(validDoc);
 
@@ -264,13 +268,12 @@ public sealed class SkipDetectionProcessor : BackgroundService
             {
                 matchedRecords++;
 
-                // destination fields
                 var dUserId = destMin.GetValue("user_id", BsonNull.Value);
                 var dId = destMin.GetValue("id", BsonNull.Value);
                 var dTitle = destMin.GetValue("title", BsonNull.Value);
                 var dBody = destMin.GetValue("body", BsonNull.Value);
 
-                // Rule #1 exact match all 4 fields
+                // Exact match on all 4 fields
                 var userOk = BsonValuesEqual(vUserId, dUserId);
                 var idOk = BsonValuesEqual(vId, dId);
                 var titleOk = BsonValuesEqual(vTitle, dTitle);
@@ -287,6 +290,7 @@ public sealed class SkipDetectionProcessor : BackgroundService
                 if (!seenObjectIds.Add(oidKey))
                     continue;
 
+                // Store the destination record as the "skip record"
                 var outDoc = new BsonDocument
                 {
                     { "objectid", objectId },
@@ -294,13 +298,7 @@ public sealed class SkipDetectionProcessor : BackgroundService
                     { "id", dId.IsBsonNull ? vId : dId },
                     { "title", dTitle.IsBsonNull ? vTitle : dTitle },
                     { "body", dBody.IsBsonNull ? vBody : dBody },
-                    { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key },
-
-                    // metadata fields you requested
-                    { "created_user", destMin.GetValue("created_user", BsonNull.Value) },
-                    { "last_edited_user", destMin.GetValue("last_edited_user", BsonNull.Value) },
-                    { "created_date", destMin.GetValue("created_date", BsonNull.Value) },
-                    { "last_edited_date", destMin.GetValue("last_edited_date", BsonNull.Value) }
+                    { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key }
                 };
 
                 skipPayload.Add(outDoc);
@@ -308,28 +306,41 @@ public sealed class SkipDetectionProcessor : BackgroundService
             }
         }
 
-        var fetchedAtLocalText = destSnap.GetValue("fetchedAtLocalText", BsonNull.Value);
-        var timeZoneId = destSnap.GetValue("timeZoneId", BsonNull.Value);
-        var layerUrl = destSnap.GetValue("layerUrl", BsonNull.Value);
+        // Write Skip_Data snapshot
+        var tz = ResolveTimeZone(_mongo.TimeZoneId);
+        var fetchedUtc = DateTime.UtcNow;
+        var fetchedLocal = TimeZoneInfo.ConvertTimeFromUtc(fetchedUtc, tz);
+        var fetchedAtLocalText = fetchedLocal.ToString("M/d/yyyy, hh:mm tt", CultureInfo.InvariantCulture);
+
+        var offset = tz.GetUtcOffset(fetchedUtc);
+        var sign = offset >= TimeSpan.Zero ? "+" : "-";
+        var abs = offset.Duration();
+        var offsetText = $" {sign}{abs:hh\\:mm}";
+        var timeZoneDisplay = $"{tz.Id} UTC{offsetText}";
 
         var envelope = new BsonDocument
         {
             { "_id", SkipLatestId },
             { "status", "ok" },
             { "layerUrl", layerUrl },
+            { "objectIdField", oidField },
             { "fetchedAtLocalText", fetchedAtLocalText },
-            { "timeZoneId", timeZoneId },
+            { "timeZoneId", timeZoneDisplay },
 
-            { "destKeysBuilt", destKeysBuilt },
-            { "destDistinctKeys", destDistinctKeys },
+            { "destObjectIdCount", objectIds.Count },
+            { "destDistinctKeys", destKeysBuilt },
+            { "destRecordsBuilt", destRecordsBuilt },
             { "destSkippedNoAttrs", destSkippedNoAttrs },
             { "destSkippedNoKey", destSkippedNoKey },
             { "destSkippedNoObjectId", destSkippedNoObjectId },
+
             { "validSkippedNoKey", validSkippedNoKey },
 
             { "comparedValidKeys", comparedKeys },
             { "matchedKeys", matchedKeys },
             { "matchedRecords", matchedRecords },
+
+            { "deductedUpdateKeysCount", updateKeySet.Count },
 
             { "skipCount", skipCount },
             { "itemCount", skipPayload.Count },
@@ -343,9 +354,233 @@ public sealed class SkipDetectionProcessor : BackgroundService
             ct);
 
         _logger.LogInformation(
-            "Skip_Data snapshot updated. destKeysBuilt={DestKeysBuilt} destDistinctKeys={DestDistinctKeys} comparedKeys={ComparedKeys} matchedKeys={MatchedKeys} matchedRecords={MatchedRecords} skipCount={SkipCount} mongo={Db}.{Col} _id={Id}",
-            destKeysBuilt, destDistinctKeys, comparedKeys, matchedKeys, matchedRecords, skipCount, _mongo.Database, _mongo.SkipCollection, SkipLatestId);
+            "Skip_Data snapshot updated (LIVE FS). comparedValidKeys={Compared} matchedKeys={MatchedKeys} matchedRecords={MatchedRecords} skipCount={SkipCount}",
+            comparedKeys, matchedKeys, matchedRecords, skipCount);
     }
+
+    private async Task WriteWaiting(IMongoCollection<BsonDocument> skipCol, string status, string reason, CancellationToken ct)
+    {
+        var envelope = new BsonDocument
+        {
+            { "_id", SkipLatestId },
+            { "status", status },
+            { "reason", reason },
+            { "skipCount", 0 },
+            { "itemCount", 0 },
+            { "payload", new BsonArray() }
+        };
+
+        await skipCol.ReplaceOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", SkipLatestId),
+            envelope,
+            new ReplaceOptions { IsUpsert = true },
+            ct);
+    }
+
+    // ---------------------------
+    // ArcGIS REST helpers
+    // ---------------------------
+
+    private void ApplyRefererHeader(HttpRequestMessage req)
+    {
+        if (!string.Equals(_portal.Client, "referer", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var referer = _portal.Referer;
+        if (string.IsNullOrWhiteSpace(referer))
+            return;
+
+        if (Uri.TryCreate(referer, UriKind.Absolute, out var uri))
+            req.Headers.Referrer = uri;
+
+        req.Headers.TryAddWithoutValidation("Referer", referer);
+    }
+
+    private async Task<string> GetPortalToken(CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(_token) && _tokenExpiresAtUtc > DateTimeOffset.UtcNow.AddMinutes(2))
+            return _token!;
+
+        if (string.IsNullOrWhiteSpace(_portal.GenerateTokenUrl))
+            throw new InvalidOperationException("ArcGisPortal.GenerateTokenUrl is empty.");
+
+        if (string.IsNullOrWhiteSpace(_portal.Username) || string.IsNullOrWhiteSpace(_portal.Password))
+            throw new InvalidOperationException("ArcGisPortal.Username/Password must be set in appsettings.json.");
+
+        var http = _httpFactory.CreateClient("arcgis");
+
+        var form = new Dictionary<string, string>
+        {
+            ["f"] = "json",
+            ["username"] = _portal.Username,
+            ["password"] = _portal.Password,
+            ["client"] = string.IsNullOrWhiteSpace(_portal.Client) ? "requestip" : _portal.Client,
+            ["expiration"] = Math.Max(1, _portal.ExpirationMinutes).ToString(CultureInfo.InvariantCulture)
+        };
+
+        if (string.Equals(form["client"], "referer", StringComparison.OrdinalIgnoreCase))
+            form["referer"] = _portal.Referer ?? "";
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, _portal.GenerateTokenUrl)
+        {
+            Content = new FormUrlEncodedContent(form)
+        };
+
+        ApplyRefererHeader(req);
+
+        using var res = await http.SendAsync(req, ct);
+        var raw = await res.Content.ReadAsStringAsync(ct);
+
+        if (!res.IsSuccessStatusCode)
+            throw new InvalidOperationException($"generateToken failed. status={(int)res.StatusCode} body={raw}");
+
+        using var doc = JsonDocument.Parse(raw);
+        var root = doc.RootElement;
+
+        if (root.TryGetProperty("error", out var err))
+            throw new InvalidOperationException($"generateToken error: {err.GetRawText()}");
+
+        if (!root.TryGetProperty("token", out var tokenEl) || tokenEl.ValueKind != JsonValueKind.String)
+            throw new InvalidOperationException($"generateToken missing token. body={raw}");
+
+        var token = tokenEl.GetString()!;
+
+        DateTimeOffset expiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(Math.Max(1, _portal.ExpirationMinutes));
+        if (root.TryGetProperty("expires", out var expEl) && expEl.ValueKind == JsonValueKind.Number)
+            if (expEl.TryGetInt64(out var ms))
+                expiresAtUtc = DateTimeOffset.FromUnixTimeMilliseconds(ms);
+
+        _token = token;
+        _tokenExpiresAtUtc = expiresAtUtc;
+
+        return token;
+    }
+
+    private async Task<(string oidField, List<int> objectIds)> QueryAllObjectIds(string layerUrl, string token, CancellationToken ct)
+    {
+        var http = _httpFactory.CreateClient("arcgis");
+
+        var qs = new Dictionary<string, string>
+        {
+            ["where"] = _dest.Where,
+            ["returnIdsOnly"] = "true",
+            ["f"] = "json",
+            ["token"] = token
+        };
+
+        var url = $"{layerUrl}/query?{ToQueryString(qs)}";
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        ApplyRefererHeader(req);
+
+        using var res = await http.SendAsync(req, ct);
+        var raw = await res.Content.ReadAsStringAsync(ct);
+
+        if (!res.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Destination returnIdsOnly failed. status={(int)res.StatusCode} body={raw}");
+
+        using var doc = JsonDocument.Parse(raw);
+        var root = doc.RootElement;
+
+        if (root.TryGetProperty("error", out var err))
+            throw new InvalidOperationException($"Destination returnIdsOnly error: {err.GetRawText()}");
+
+        var oidField = "OBJECTID";
+        if (root.TryGetProperty("objectIdFieldName", out var oidEl) && oidEl.ValueKind == JsonValueKind.String)
+            oidField = oidEl.GetString() ?? "OBJECTID";
+
+        var ids = new List<int>();
+        if (root.TryGetProperty("objectIds", out var idsEl) && idsEl.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var el in idsEl.EnumerateArray())
+                if (TryGetIntLike(el, out var v))
+                    ids.Add(v);
+        }
+
+        ids.Sort();
+        return (oidField, ids);
+    }
+
+    private async Task<JsonElement> QueryByObjectIds(string layerUrl, string token, string oidField, List<int> objectIds, CancellationToken ct)
+    {
+        var http = _httpFactory.CreateClient("arcgis");
+
+        var qs = new Dictionary<string, string>
+        {
+            ["where"] = _dest.Where,
+            ["objectIds"] = string.Join(",", objectIds),
+            ["outFields"] = _dest.OutFields,
+            ["returnGeometry"] = "false",
+            ["orderByFields"] = oidField,
+            ["f"] = "json",
+            ["token"] = token
+        };
+
+        var url = $"{layerUrl}/query?{ToQueryString(qs)}";
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        ApplyRefererHeader(req);
+
+        using var res = await http.SendAsync(req, ct);
+        var raw = await res.Content.ReadAsStringAsync(ct);
+
+        if (!res.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Destination /query by objectIds failed. status={(int)res.StatusCode} body={raw}");
+
+        using var doc = JsonDocument.Parse(raw);
+        var root = doc.RootElement;
+
+        if (root.TryGetProperty("error", out var err))
+            throw new InvalidOperationException($"Destination /query by objectIds error: {err.GetRawText()}");
+
+        return root.Clone();
+    }
+
+    private static bool TryGetIntLike(JsonElement el, out int value)
+    {
+        value = default;
+        try
+        {
+            return el.ValueKind switch
+            {
+                JsonValueKind.Number when el.TryGetInt32(out var i) => (value = i) == i,
+                JsonValueKind.Number when el.TryGetInt64(out var l) && l >= int.MinValue && l <= int.MaxValue => (value = (int)l) == (int)l,
+                JsonValueKind.String when int.TryParse(el.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) => (value = s) == s,
+                _ => false
+            };
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static IEnumerable<List<int>> Chunk(List<int> source, int size)
+    {
+        if (size <= 0) size = 1;
+        for (var i = 0; i < source.Count; i += size)
+        {
+            var take = Math.Min(size, source.Count - i);
+            yield return source.GetRange(i, take);
+        }
+    }
+
+    private static string ToQueryString(Dictionary<string, string> qs)
+    {
+        var sb = new StringBuilder();
+        foreach (var (k, v) in qs)
+        {
+            if (sb.Length > 0) sb.Append('&');
+            sb.Append(Uri.EscapeDataString(k));
+            sb.Append('=');
+            sb.Append(Uri.EscapeDataString(v ?? ""));
+        }
+        return sb.ToString();
+    }
+
+    // ---------------------------
+    // Key + comparison helpers
+    // ---------------------------
 
     private BsonValue ChooseValidUserId(BsonDocument validDoc)
     {
@@ -374,7 +609,6 @@ public sealed class SkipDetectionProcessor : BackgroundService
         if (fields.Length == 0) return "";
 
         var parts = new List<string>(fields.Length);
-
         foreach (var f0 in fields)
         {
             var f = (f0 ?? "").Trim();
@@ -392,23 +626,7 @@ public sealed class SkipDetectionProcessor : BackgroundService
         return string.Join(_dup.KeyJoiner ?? "", parts);
     }
 
-    private static string NormalizeKey(string? s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return "";
-        return s.Trim();
-    }
-
-    private static string NormalizeFieldName(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return "";
-        var chars = new List<char>(s.Length);
-        foreach (var ch in s)
-        {
-            if (char.IsLetterOrDigit(ch))
-                chars.Add(char.ToLowerInvariant(ch));
-        }
-        return new string(chars.ToArray());
-    }
+    private static string NormalizeKey(string? s) => string.IsNullOrWhiteSpace(s) ? "" : s.Trim();
 
     private static string GetStringCaseInsensitive(BsonDocument doc, string fieldName)
     {
@@ -416,25 +634,8 @@ public sealed class SkipDetectionProcessor : BackgroundService
             return "";
 
         foreach (var e in doc.Elements)
-        {
             if (string.Equals(e.Name, fieldName, StringComparison.OrdinalIgnoreCase))
-            {
-                if (e.Value.IsBsonNull) return "";
-                var s = e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? "");
-                return s ?? "";
-            }
-        }
-
-        var target = NormalizeFieldName(fieldName);
-        foreach (var e in doc.Elements)
-        {
-            if (NormalizeFieldName(e.Name) == target)
-            {
-                if (e.Value.IsBsonNull) return "";
-                var s = e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? "");
-                return s ?? "";
-            }
-        }
+                return e.Value.IsBsonNull ? "" : (e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? ""));
 
         return "";
     }
@@ -448,35 +649,18 @@ public sealed class SkipDetectionProcessor : BackgroundService
             if (string.Equals(e.Name, field, StringComparison.OrdinalIgnoreCase))
                 return e.Value;
 
-        var pas = ToPascalCase(field);
-        foreach (var e in doc.Elements)
-            if (string.Equals(e.Name, pas, StringComparison.OrdinalIgnoreCase))
-                return e.Value;
-
-        var cam = ToCamelCase(field);
-        foreach (var e in doc.Elements)
-            if (string.Equals(e.Name, cam, StringComparison.OrdinalIgnoreCase))
-                return e.Value;
-
-        var target = NormalizeFieldName(field);
-        foreach (var e in doc.Elements)
-            if (NormalizeFieldName(e.Name) == target)
-                return e.Value;
-
         return BsonNull.Value;
     }
 
     private static bool BsonValuesEqual(BsonValue a, BsonValue b)
     {
-        if (a is null) a = BsonNull.Value;
-        if (b is null) b = BsonNull.Value;
+        a ??= BsonNull.Value;
+        b ??= BsonNull.Value;
 
         if (a.IsBsonNull && b.IsBsonNull)
             return true;
 
-        var sa = NormalizeForCompare(a);
-        var sb = NormalizeForCompare(b);
-        return string.Equals(sa, sb, StringComparison.Ordinal);
+        return string.Equals(NormalizeForCompare(a), NormalizeForCompare(b), StringComparison.Ordinal);
     }
 
     private static string NormalizeForCompare(BsonValue v)
@@ -506,38 +690,7 @@ public sealed class SkipDetectionProcessor : BackgroundService
     private static string NormalizeKeyPart(BsonValue v)
     {
         if (v is null || v.IsBsonNull) return "";
-
-        try
-        {
-            return v.BsonType switch
-            {
-                BsonType.String => (v.AsString ?? "").Trim(),
-                BsonType.Int32 => v.AsInt32.ToString(CultureInfo.InvariantCulture),
-                BsonType.Int64 => v.AsInt64.ToString(CultureInfo.InvariantCulture),
-                BsonType.Double => v.AsDouble.ToString("G17", CultureInfo.InvariantCulture),
-                BsonType.Decimal128 => Decimal128.ToDecimal(v.AsDecimal128).ToString(CultureInfo.InvariantCulture),
-                BsonType.Boolean => v.AsBoolean ? "true" : "false",
-                _ => (v.ToString() ?? "").Trim()
-            };
-        }
-        catch
-        {
-            return (v.ToString() ?? "").Trim();
-        }
-    }
-
-    private static string ToPascalCase(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return s;
-        if (s.Length == 1) return s.ToUpperInvariant();
-        return char.ToUpperInvariant(s[0]) + s.Substring(1);
-    }
-
-    private static string ToCamelCase(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return s;
-        if (s.Length == 1) return s.ToLowerInvariant();
-        return char.ToLowerInvariant(s[0]) + s.Substring(1);
+        return NormalizeForCompare(v);
     }
 
     private static TimeZoneInfo ResolveTimeZone(string? timeZoneId)
@@ -560,71 +713,10 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
             if (map.TryGetValue(timeZoneId, out var windowsId))
             {
-                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); }
-                catch { }
+                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); } catch { }
             }
 
             return TimeZoneInfo.Local;
-        }
-    }
-
-    private static BsonValue FormatDateFieldToLocalText(BsonValue v, TimeZoneInfo tz)
-    {
-        if (v is null || v.IsBsonNull)
-            return BsonNull.Value;
-
-        if (v.BsonType == BsonType.String)
-        {
-            var s = (v.AsString ?? "").Trim();
-            if (s.Length == 0) return BsonNull.Value;
-
-            if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var msStr))
-                return new BsonString(FormatEpochMs(msStr, tz));
-
-            return v;
-        }
-
-        if (!TryReadEpochMs(v, out var ms))
-            return v;
-
-        var formatted = FormatEpochMs(ms, tz);
-        return string.IsNullOrWhiteSpace(formatted) ? v : new BsonString(formatted);
-    }
-
-    private static bool TryReadEpochMs(BsonValue v, out long ms)
-    {
-        ms = 0;
-
-        try
-        {
-            return v.BsonType switch
-            {
-                BsonType.Int64 => (ms = v.AsInt64) >= 0,
-                BsonType.Int32 => (ms = v.AsInt32) >= 0,
-                BsonType.Double => (ms = Convert.ToInt64(v.AsDouble)) >= 0,
-                BsonType.Decimal128 => (ms = (long)Decimal128.ToDecimal(v.AsDecimal128)) >= 0,
-                BsonType.String when long.TryParse(v.AsString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s)
-                    => (ms = s) >= 0,
-                _ => false
-            };
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static string FormatEpochMs(long ms, TimeZoneInfo tz)
-    {
-        try
-        {
-            var utc = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
-            var local = TimeZoneInfo.ConvertTimeFromUtc(utc, tz);
-            return local.ToString("M/d/yyyy, hh:mm tt", CultureInfo.InvariantCulture);
-        }
-        catch
-        {
-            return "";
         }
     }
 }

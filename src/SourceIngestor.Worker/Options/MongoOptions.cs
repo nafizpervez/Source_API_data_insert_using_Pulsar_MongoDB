@@ -29,12 +29,19 @@ public sealed class MongoOptions
     // delete items snapshot collection (exists in destination but NOT in source)
     public string DeleteCollection { get; set; } = "Delete_Data";
 
-    // NEW: insert items snapshot collection (exists in source but NOT in destination)
+    // insert items snapshot collection (exists in source but NOT in destination)
     public string InsertCollection { get; set; } = "Insert_Data";
 
     // Source API fetch outcome collections (same DB)
     public string SourceSuccessIdCollection { get; set; } = "Source_Success_ID";
     public string SourceFailedIdCollection { get; set; } = "Source_Failed_ID";
+
+    // NEW: Destination apply outcome collections
+    public string DestinationSuccessIdCollection { get; set; } = "Destination_Success_ID";
+    public string DestinationFailedIdCollection { get; set; } = "Destination_Failed_ID";
+
+    // NEW: Final dataset snapshot after applying Update/Delete/Insert
+    public string FinalDestinationCollection { get; set; } = "Final_Destination_Data";
 
     public string? TimeZoneId { get; set; }
 }
