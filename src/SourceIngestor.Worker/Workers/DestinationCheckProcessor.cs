@@ -18,21 +18,17 @@ namespace SourceIngestor.Worker.Workers;
 /// DestinationCheckProcessor (NON-CONTINUOUS):
 /// - Seeds exactly 1 job on container start.
 /// - Consumes that job, checks Destination FS is alive.
-/// - Waits until diff snapshots exist (Update/Delete/Insert and optional Skip).
+/// - WAITS (gates) until diff snapshots are ready (Update/Delete/Insert/Skip status="ok").
 /// - Applies applyEdits using Update_Data + Delete_Data + Insert_Data.
 /// - Fetches final destination snapshot into Final_Destination_Data.
 /// - Writes Destination_Success_ID or Destination_Failed_ID.
-/// - On any failure, schedules retry using the fixed plan:
+/// - On any failure, schedules retry:
 ///     try1 immediate -> +1m -> +3m -> +9m -> then DLQ + Failed.
+/// - On SUCCESS or TERMINAL FAIL -> stops (non-continuous).
 /// </summary>
 public sealed class DestinationCheckProcessor : BackgroundService
 {
     // Retry plan (total 4 tries):
-    // - Try 1: immediately (Attempt = 0)
-    // - Try 2: after 1 minute (Attempt = 1)
-    // - Try 3: after 3 minutes (Attempt = 2)
-    // - Try 4: after 9 minutes (Attempt = 3)
-    // If try 4 also fails -> push to DLQ + write Destination_Failed_ID and STOP.
     private static readonly TimeSpan[] RetryDelays =
     [
         TimeSpan.FromMinutes(1), // Attempt 1 => Try 2
@@ -109,6 +105,11 @@ public sealed class DestinationCheckProcessor : BackgroundService
         _logger.LogInformation("Mongo destination failed collection: {Db}.{Col}", _mongo.Database, _mongo.DestinationFailedIdCollection);
         _logger.LogInformation("Mongo final destination collection: {Db}.{Col}", _mongo.Database, _mongo.FinalDestinationCollection);
 
+        var pollSeconds = Math.Max(1, _dest.GatePollSeconds);
+        var maxWaitSeconds = Math.Max(5, _dest.GateMaxWaitSeconds);
+
+        _logger.LogInformation("Gating config: pollSeconds={PollSeconds} maxWaitSeconds={MaxWaitSeconds}", pollSeconds, maxWaitSeconds);
+
         await using var consumer = _pulsarClient.NewConsumer(Schema.String)
             .Topic(_pulsar.DestinationCheckTopic)
             .SubscriptionName(_pulsar.Subscription + "-destination-check")
@@ -137,6 +138,7 @@ public sealed class DestinationCheckProcessor : BackgroundService
             "Seeded DestinationCheckJob jobId={JobId} (try=1) url={Url} into {Topic}",
             seedJobId, seed.Url, _pulsar.DestinationCheckTopic);
 
+        // Non-continuous: after SUCCESS or TERMINAL FAIL, we stop consuming.
         await foreach (var msg in consumer.Messages(stoppingToken))
         {
             try
@@ -180,36 +182,52 @@ public sealed class DestinationCheckProcessor : BackgroundService
                         "DEST_RESULT jobId={JobId} try={TryNo} => DOWN status={Status} reason={Reason}",
                         job.JobId, tryNo, alive.StatusCode, alive.Reason);
 
-                    await ScheduleRetryOrStop(job, jobObjectId, checkProducer, dlqProducer, alive, stoppingToken);
+                    var terminal = await ScheduleRetryOrStop(job, jobObjectId, checkProducer, dlqProducer, alive, stoppingToken);
+
                     await consumer.Acknowledge(msg, stoppingToken);
+
+                    if (terminal)
+                    {
+                        _logger.LogInformation("DEST_TERMINAL_FAIL_STOP jobId={JobId} try={TryNo}", job.JobId, tryNo);
+                        return;
+                    }
+
                     continue;
                 }
 
                 _logger.LogInformation(
-                    "DEST_RESULT jobId={JobId} try={TryNo} => ALIVE status={Status}. Checking diff snapshots...",
+                    "DEST_RESULT jobId={JobId} try={TryNo} => ALIVE status={Status}. Waiting for diff snapshots...",
                     job.JobId, tryNo, alive.StatusCode);
 
-                // 2) GATING LOGIC (CRITICAL FIX):
-                // Wait until Update/Delete/Insert snapshots exist and have status="ok".
-                // This prevents the "updates=0 deletes=0 inserts=0" bug from running too early.
-                var gate = await CheckDiffSnapshotsReady(stoppingToken);
+                // 2) GATING (CRITICAL FIX):
+                // Wait/poll until Update/Delete/Insert/Skip exist and status="ok" within a max wait window.
+                var gateWait = await WaitForDiffSnapshotsAsync(
+                    pollInterval: TimeSpan.FromSeconds(pollSeconds),
+                    maxWait: TimeSpan.FromSeconds(maxWaitSeconds),
+                    ct: stoppingToken);
 
-                if (!gate.Ready)
+                if (!gateWait.Ready)
                 {
                     _logger.LogWarning(
-                        "DEST_GATE_NOT_READY jobId={JobId} try={TryNo} => {Reason}. Will retry if attempts remain.",
-                        job.JobId, tryNo, gate.Reason);
+                        "DEST_GATE_TIMEOUT jobId={JobId} try={TryNo} => {Reason}. Will retry if attempts remain.",
+                        job.JobId, tryNo, gateWait.Reason);
 
-                    // Treat as "down" for scheduling purposes (but with a clear reason)
-                    await ScheduleRetryOrStop(
+                    var terminal = await ScheduleRetryOrStop(
                         job,
                         jobObjectId,
                         checkProducer,
                         dlqProducer,
-                        new AliveResult(false, HttpStatusCode.OK, "waiting_for_diff_snapshots:" + gate.Reason),
+                        new AliveResult(false, HttpStatusCode.OK, "waiting_for_diff_snapshots:" + gateWait.Reason),
                         stoppingToken);
 
                     await consumer.Acknowledge(msg, stoppingToken);
+
+                    if (terminal)
+                    {
+                        _logger.LogInformation("DEST_TERMINAL_FAIL_STOP jobId={JobId} try={TryNo}", job.JobId, tryNo);
+                        return;
+                    }
+
                     continue;
                 }
 
@@ -226,7 +244,7 @@ public sealed class DestinationCheckProcessor : BackgroundService
                         "DEST_APPLY_FAILED jobId={JobId} try={TryNo} reason={Reason}",
                         job.JobId, tryNo, apply.Reason);
 
-                    await ScheduleRetryOrStop(
+                    var terminal = await ScheduleRetryOrStop(
                         job,
                         jobObjectId,
                         checkProducer,
@@ -235,6 +253,13 @@ public sealed class DestinationCheckProcessor : BackgroundService
                         stoppingToken);
 
                     await consumer.Acknowledge(msg, stoppingToken);
+
+                    if (terminal)
+                    {
+                        _logger.LogInformation("DEST_TERMINAL_FAIL_STOP jobId={JobId} try={TryNo}", job.JobId, tryNo);
+                        return;
+                    }
+
                     continue;
                 }
 
@@ -255,10 +280,13 @@ public sealed class DestinationCheckProcessor : BackgroundService
                     stoppingToken: stoppingToken);
 
                 _logger.LogInformation(
-                    "DEST_SUCCESS_STOP jobId={JobId} try={TryNo} => Success audit written. Non-continuous mode: no new job seeded.",
+                    "DEST_SUCCESS_STOP jobId={JobId} try={TryNo} => Success audit written. Non-continuous mode: stopping.",
                     job.JobId, tryNo);
 
                 await consumer.Acknowledge(msg, stoppingToken);
+
+                // Non-continuous: stop the worker after a successful run.
+                return;
             }
             catch (Exception ex)
             {
@@ -268,10 +296,49 @@ public sealed class DestinationCheckProcessor : BackgroundService
     }
 
     // ------------------------------------------------------------
-    // GATING LOGIC (wait until diff snapshots exist and ready)
+    // GATING LOGIC (poll until diff snapshots exist and ready)
     // ------------------------------------------------------------
 
     private sealed record GateResult(bool Ready, string Reason);
+
+    private async Task<GateResult> WaitForDiffSnapshotsAsync(TimeSpan pollInterval, TimeSpan maxWait, CancellationToken ct)
+    {
+        var start = DateTimeOffset.UtcNow;
+        var tries = 0;
+
+        while (!ct.IsCancellationRequested)
+        {
+            tries++;
+
+            var gate = await CheckDiffSnapshotsReady(ct);
+            if (gate.Ready)
+            {
+                _logger.LogInformation("DEST_GATE_OK after {Tries} checks. waitedSeconds={WaitedSeconds}",
+                    tries, (DateTimeOffset.UtcNow - start).TotalSeconds.ToString("F0", CultureInfo.InvariantCulture));
+
+                return gate;
+            }
+
+            var elapsed = DateTimeOffset.UtcNow - start;
+            if (elapsed >= maxWait)
+            {
+                _logger.LogWarning("DEST_GATE_TIMEOUT after {Tries} checks. waitedSeconds={WaitedSeconds}. lastReason={Reason}",
+                    tries, elapsed.TotalSeconds.ToString("F0", CultureInfo.InvariantCulture), gate.Reason);
+
+                return new GateResult(false, $"timeout_after_{elapsed.TotalSeconds:F0}s: {gate.Reason}");
+            }
+
+            if (tries == 1 || tries % 6 == 0)
+            {
+                _logger.LogInformation("DEST_GATE_WAITING check={Check} waitedSeconds={WaitedSeconds} reason={Reason}",
+                    tries, elapsed.TotalSeconds.ToString("F0", CultureInfo.InvariantCulture), gate.Reason);
+            }
+
+            await Task.Delay(pollInterval, ct);
+        }
+
+        return new GateResult(false, "canceled");
+    }
 
     private async Task<GateResult> CheckDiffSnapshotsReady(CancellationToken ct)
     {
@@ -282,21 +349,20 @@ public sealed class DestinationCheckProcessor : BackgroundService
         var insertCol = db.GetCollection<BsonDocument>(_mongo.InsertCollection);
         var skipCol = db.GetCollection<BsonDocument>(_mongo.SkipCollection);
 
-        // We require these 3 to exist and be status="ok":
         var updateSnap = await updateCol.Find(Builders<BsonDocument>.Filter.Eq("_id", UpdateLatestId)).FirstOrDefaultAsync(ct);
         var deleteSnap = await deleteCol.Find(Builders<BsonDocument>.Filter.Eq("_id", DeleteLatestId)).FirstOrDefaultAsync(ct);
         var insertSnap = await insertCol.Find(Builders<BsonDocument>.Filter.Eq("_id", InsertLatestId)).FirstOrDefaultAsync(ct);
-
-        // Skip is optional for applyEdits, but we still want it ready so skipCount is meaningful.
         var skipSnap = await skipCol.Find(Builders<BsonDocument>.Filter.Eq("_id", SkipLatestId)).FirstOrDefaultAsync(ct);
 
         if (updateSnap is null) return new GateResult(false, "Update_Data snapshot not found");
         if (deleteSnap is null) return new GateResult(false, "Delete_Data snapshot not found");
         if (insertSnap is null) return new GateResult(false, "Insert_Data snapshot not found");
+        if (skipSnap is null) return new GateResult(false, "Skip_Data snapshot not found");
 
         var uStatus = GetStringSafe(updateSnap, "status");
         var dStatus = GetStringSafe(deleteSnap, "status");
         var iStatus = GetStringSafe(insertSnap, "status");
+        var sStatus = GetStringSafe(skipSnap, "status");
 
         if (!string.Equals(uStatus, "ok", StringComparison.OrdinalIgnoreCase))
             return new GateResult(false, $"Update_Data status='{uStatus}'");
@@ -307,8 +373,6 @@ public sealed class DestinationCheckProcessor : BackgroundService
         if (!string.Equals(iStatus, "ok", StringComparison.OrdinalIgnoreCase))
             return new GateResult(false, $"Insert_Data status='{iStatus}'");
 
-        if (skipSnap is null) return new GateResult(false, "Skip_Data snapshot not found");
-        var sStatus = GetStringSafe(skipSnap, "status");
         if (!string.Equals(sStatus, "ok", StringComparison.OrdinalIgnoreCase))
             return new GateResult(false, $"Skip_Data status='{sStatus}'");
 
@@ -365,12 +429,11 @@ public sealed class DestinationCheckProcessor : BackgroundService
         {
             var token = await GetPortalToken(ct);
 
-            // Cheap check: returnIdsOnly=true
             var http = _httpFactory.CreateClient("arcgis");
 
             var qs = new Dictionary<string, string>
             {
-                ["where"] = _dest.Where,
+                ["where"] = _dest.Where ?? "1=1",
                 ["returnIdsOnly"] = "true",
                 ["f"] = "json",
                 ["token"] = token
@@ -425,6 +488,9 @@ public sealed class DestinationCheckProcessor : BackgroundService
     {
         var token = await GetPortalToken(ct);
 
+        // Determine the real OBJECTID field name from the layer (do not assume casing).
+        var (oidField, _) = await QueryAllObjectIds(layerUrl, token, ct);
+
         var db = _mongoClient.GetDatabase(_mongo.Database);
 
         var updateCol = db.GetCollection<BsonDocument>(_mongo.UpdateCollection);
@@ -435,11 +501,9 @@ public sealed class DestinationCheckProcessor : BackgroundService
         var deleteSnap = await deleteCol.Find(Builders<BsonDocument>.Filter.Eq("_id", DeleteLatestId)).FirstOrDefaultAsync(ct);
         var insertSnap = await insertCol.Find(Builders<BsonDocument>.Filter.Eq("_id", InsertLatestId)).FirstOrDefaultAsync(ct);
 
-        var updates = ExtractUpdateFeatures(updateSnap);
+        var updates = ExtractUpdateFeatures(updateSnap, oidField);
         var deletes = ExtractDeleteObjectIds(deleteSnap);
         var inserts = ExtractInsertFeatures(insertSnap);
-
-        // Skip_Data is a no-op (we intentionally do nothing for skip items)
 
         if (updates.Count == 0 && deletes.Count == 0 && inserts.Count == 0)
         {
@@ -459,8 +523,9 @@ public sealed class DestinationCheckProcessor : BackgroundService
             ["token"] = token
         };
 
-        if (updates.Count > 0) form["updateFeatures"] = updateJson;
-        if (inserts.Count > 0) form["addFeatures"] = insertJson;
+        // ArcGIS REST applyEdits expects: adds, updates, deletes
+        if (updates.Count > 0) form["updates"] = updateJson;
+        if (inserts.Count > 0) form["adds"] = insertJson;
         if (deletes.Count > 0) form["deletes"] = deleteCsv;
 
         var url = $"{layerUrl.TrimEnd('/')}/applyEdits";
@@ -474,7 +539,6 @@ public sealed class DestinationCheckProcessor : BackgroundService
         using var res = await http.SendAsync(req, ct);
         var raw = await res.Content.ReadAsStringAsync(ct);
 
-        // IMPORTANT: log raw response (trimmed) so you can paste it to me easily
         _logger.LogInformation("applyEdits raw response (first 2000 chars): {Raw}",
             raw.Length <= 2000 ? raw : raw.Substring(0, 2000) + "...");
 
@@ -524,10 +588,10 @@ public sealed class DestinationCheckProcessor : BackgroundService
     }
 
     // Update_Data row: { objectid, final_title, final_body, ... }
-    private static List<Dictionary<string, object>> ExtractUpdateFeatures(BsonDocument? snap)
+    // ArcGIS requires the correct OBJECTID field name; we use oidField from the service.
+    private static List<Dictionary<string, object>> ExtractUpdateFeatures(BsonDocument? snap, string oidField)
     {
         var list = new List<Dictionary<string, object>>();
-
         if (snap is null) return list;
         if (!snap.TryGetValue("payload", out var payloadVal) || payloadVal.BsonType != BsonType.Array) return list;
 
@@ -539,13 +603,17 @@ public sealed class DestinationCheckProcessor : BackgroundService
             var oid = GetIntLike(d.GetValue("objectid", BsonNull.Value));
             if (oid is null) continue;
 
-            var finalTitle = GetStringLike(d.GetValue("final_title", BsonNull.Value));
-            var finalBody = GetStringLike(d.GetValue("final_body", BsonNull.Value));
+            // Prefer final_* but fall back to title/body if your UpdateDetectionProcessor writes those instead.
+            var finalTitle = GetStringLike(d.GetValue("final_title", BsonNull.Value)) ?? GetStringLike(d.GetValue("title", BsonNull.Value));
+            var finalBody = GetStringLike(d.GetValue("final_body", BsonNull.Value)) ?? GetStringLike(d.GetValue("body", BsonNull.Value));
 
-            // Update only title/body. Do NOT touch created_* fields.
+            // If nothing to update, don't send this record (some services reject "update with only OBJECTID")
+            if (finalTitle is null && finalBody is null)
+                continue;
+
             var attrs = new Dictionary<string, object>
             {
-                ["objectid"] = oid.Value
+                [oidField] = oid.Value
             };
 
             if (finalTitle is not null) attrs["title"] = finalTitle;
@@ -681,7 +749,6 @@ public sealed class DestinationCheckProcessor : BackgroundService
         var (oidField, objectIds) = await QueryAllObjectIds(layerUrl, token, ct);
 
         var batchSize = Math.Max(1, _dest.QueryBatchSize);
-
         var payload = new BsonArray();
 
         foreach (var chunk in Chunk(objectIds, batchSize))
@@ -698,7 +765,6 @@ public sealed class DestinationCheckProcessor : BackgroundService
 
                 var attrsDoc = BsonDocument.Parse(attrsEl.GetRawText());
 
-                // Convert epoch ms fields to local text
                 ConvertEpochMsFieldToLocalText(attrsDoc, "created_date", tz);
                 ConvertEpochMsFieldToLocalText(attrsDoc, "last_edited_date", tz);
 
@@ -755,7 +821,8 @@ public sealed class DestinationCheckProcessor : BackgroundService
     // Retry scheduler + audit writers
     // ------------------------------------------------------------
 
-    private async Task ScheduleRetryOrStop(
+    // Returns true if terminal failure happened (DLQ + Failed written).
+    private async Task<bool> ScheduleRetryOrStop(
         DestinationCheckJob job,
         ObjectId jobObjectId,
         IProducer<string> checkProducer,
@@ -803,10 +870,9 @@ public sealed class DestinationCheckProcessor : BackgroundService
                 pulsarText: $"DTQ Raised - Service Unavailable | stoppedAfterTry={lastTryNo} | schedule={string.Join(",", retryScheduleMinutes)}m | lastStatus={result.StatusCode} | lastReason={result.Reason}",
                 stoppingToken: ct);
 
-            return;
+            return true; // terminal
         }
 
-        // schedule next retry
         var delay = RetryDelays[nextAttempt - 1];
         var deliverAtUtc = DateTimeOffset.UtcNow.Add(delay);
 
@@ -820,6 +886,8 @@ public sealed class DestinationCheckProcessor : BackgroundService
         await checkProducer.NewMessage()
             .DeliverAt(deliverAtUtc.UtcDateTime)
             .Send(payload, ct);
+
+        return false;
     }
 
     private async Task WriteDestinationOutcomeAsync(
@@ -936,7 +1004,7 @@ public sealed class DestinationCheckProcessor : BackgroundService
 
         var qs = new Dictionary<string, string>
         {
-            ["where"] = _dest.Where,
+            ["where"] = _dest.Where ?? "1=1",
             ["returnIdsOnly"] = "true",
             ["f"] = "json",
             ["token"] = token
@@ -981,9 +1049,9 @@ public sealed class DestinationCheckProcessor : BackgroundService
 
         var qs = new Dictionary<string, string>
         {
-            ["where"] = _dest.Where,
+            ["where"] = _dest.Where ?? "1=1",
             ["objectIds"] = string.Join(",", objectIds),
-            ["outFields"] = _dest.OutFields,
+            ["outFields"] = _dest.OutFields ?? "*",
             ["returnGeometry"] = _dest.ReturnGeometry ? "true" : "false",
             ["orderByFields"] = oidField,
             ["f"] = "json",

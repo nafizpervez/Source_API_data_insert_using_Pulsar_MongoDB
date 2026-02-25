@@ -13,7 +13,6 @@ public sealed class InsertDetectionProcessor : BackgroundService
     private const string ValidLatestId = "valid_latest";
     private const string UpdateLatestId = "update_latest";
     private const string SkipLatestId = "skip_latest";
-
     private const string InsertLatestId = "insert_latest";
 
     private readonly IHttpClientFactory _httpFactory;
@@ -53,24 +52,15 @@ public sealed class InsertDetectionProcessor : BackgroundService
         _logger.LogInformation("InsertDetectionProcessor started.");
         _logger.LogInformation("Valid snapshot: {Col} _id={Id}", _mongo.ValidatedCollection, ValidLatestId);
         _logger.LogInformation("Insert snapshot: {Col} _id={Id}", _mongo.InsertCollection, InsertLatestId);
-        _logger.LogInformation("Destination endpoint (NOT Mongo snapshot): {Url}", _dest.FeatureLayerUrl);
+        _logger.LogInformation("Destination endpoint (LIVE): {Url}", _dest.FeatureLayerUrl);
 
         var interval = TimeSpan.FromSeconds(Math.Max(10, _dest.SyncIntervalSeconds));
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            try
-            {
-                await DetectOnce(stoppingToken);
-            }
-            catch (TaskCanceledException)
-            {
-                // shutdown
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "InsertDetectionProcessor DetectOnce failed.");
-            }
+            try { await DetectOnce(stoppingToken); }
+            catch (TaskCanceledException) { }
+            catch (Exception ex) { _logger.LogError(ex, "InsertDetectionProcessor DetectOnce failed."); }
 
             await Task.Delay(interval, stoppingToken);
         }
@@ -104,28 +94,15 @@ public sealed class InsertDetectionProcessor : BackgroundService
 
         if (validSnap is null)
         {
-            var envelopeMissing = new BsonDocument
-            {
-                { "_id", InsertLatestId },
-                { "status", "waiting_for_valid_latest" },
-                { "insertCount", 0 },
-                { "itemCount", 0 },
-                { "payload", new BsonArray() }
-            };
-
-            await insertCol.ReplaceOneAsync(
-                Builders<BsonDocument>.Filter.Eq("_id", InsertLatestId),
-                envelopeMissing,
-                new ReplaceOptions { IsUpsert = true },
-                ct);
-
+            await WriteWaiting(insertCol, "waiting_for_valid_latest", ct);
             return;
         }
 
         if (!validSnap.TryGetValue("payload", out var validPayloadVal) || validPayloadVal.BsonType != BsonType.Array)
+        {
+            await WriteWaiting(insertCol, "waiting_for_valid_payload", ct);
             return;
-
-        var validPayload = validPayloadVal.AsBsonArray;
+        }
 
         if (string.IsNullOrWhiteSpace(_portal.GenerateTokenUrl))
             throw new InvalidOperationException("ArcGisPortal.GenerateTokenUrl is empty.");
@@ -134,10 +111,8 @@ public sealed class InsertDetectionProcessor : BackgroundService
             throw new InvalidOperationException("DestinationApi.FeatureLayerUrl is empty.");
 
         var token = await GetPortalToken(ct);
-
         var layerUrl = _dest.FeatureLayerUrl.TrimEnd('/');
 
-        // Read TZ for consistency if you later want to format times, but inserts will have null metadata.
         var tz = ResolveTimeZone(_mongo.TimeZoneId);
 
         // ------------------------------------------------------------
@@ -154,8 +129,7 @@ public sealed class InsertDetectionProcessor : BackgroundService
                 if (u.BsonType != BsonType.Document) continue;
                 var ud = u.AsBsonDocument;
 
-                var k = GetStringCaseInsensitive(ud, _dup.ComputedKeyFieldName ?? "Candidate_Key_combination");
-                k = NormalizeKey(k);
+                var k = BuildCandidateKeyFromAnyDoc(ud);
                 if (!string.IsNullOrWhiteSpace(k))
                     updateKeySet.Add(k);
             }
@@ -172,8 +146,7 @@ public sealed class InsertDetectionProcessor : BackgroundService
                 if (s.BsonType != BsonType.Document) continue;
                 var sd = s.AsBsonDocument;
 
-                var k = GetStringCaseInsensitive(sd, _dup.ComputedKeyFieldName ?? "Candidate_Key_combination");
-                k = NormalizeKey(k);
+                var k = BuildCandidateKeyFromAnyDoc(sd);
                 if (!string.IsNullOrWhiteSpace(k))
                     skipKeySet.Add(k);
             }
@@ -181,11 +154,13 @@ public sealed class InsertDetectionProcessor : BackgroundService
 
         // ------------------------------------------------------------
         // Fetch destination keys DIRECTLY from FeatureLayer endpoint
+        // (DO NOT rely on CandidateKeyFields here; destination uses user_id)
         // ------------------------------------------------------------
         var (oidField, objectIds) = await QueryAllObjectIds(layerUrl, token, ct);
 
         var destKeySet = new HashSet<string>(StringComparer.Ordinal);
-        var destKeysBuilt = 0;
+        var destRecordsSeen = 0;
+        var destDistinctKeys = 0;
         var destSkippedNoAttrs = 0;
         var destSkippedNoKey = 0;
 
@@ -200,18 +175,17 @@ public sealed class InsertDetectionProcessor : BackgroundService
 
             foreach (var feat in featuresEl.EnumerateArray())
             {
+                destRecordsSeen++;
+
                 if (!feat.TryGetProperty("attributes", out var attrsEl) || attrsEl.ValueKind != JsonValueKind.Object)
                 {
                     destSkippedNoAttrs++;
                     continue;
                 }
 
-                // Parse attrs to BsonDocument so we can reuse the same casing/key helpers.
                 var attrs = BsonDocument.Parse(attrsEl.GetRawText());
 
-                var keyRaw = ComputeKeyFromAnyDoc(attrs);
-                var key = NormalizeKey(keyRaw);
-
+                var key = BuildCandidateKeyFromAnyDoc(attrs);
                 if (string.IsNullOrWhiteSpace(key))
                 {
                     destSkippedNoKey++;
@@ -219,16 +193,19 @@ public sealed class InsertDetectionProcessor : BackgroundService
                 }
 
                 if (destKeySet.Add(key))
-                    destKeysBuilt++;
+                    destDistinctKeys++;
             }
         }
 
         // ------------------------------------------------------------
         // Insert = Valid keys NOT in destination keys
         // ------------------------------------------------------------
+        var validPayload = validPayloadVal.AsBsonArray;
+
         var insertPayload = new BsonArray();
 
         var comparedValidKeys = 0;
+        var validDistinctKeys = 0;
         var validSkippedNoKey = 0;
         var insertCount = 0;
 
@@ -241,12 +218,7 @@ public sealed class InsertDetectionProcessor : BackgroundService
 
             var validDoc = v.AsBsonDocument;
 
-            var keyFromField = GetStringCaseInsensitive(validDoc, _dup.ComputedKeyFieldName ?? "Candidate_Key_combination");
-            var key = NormalizeKey(keyFromField);
-
-            if (string.IsNullOrWhiteSpace(key))
-                key = NormalizeKey(ComputeKeyFromAnyDoc(validDoc));
-
+            var key = BuildCandidateKeyFromAnyDoc(validDoc);
             if (string.IsNullOrWhiteSpace(key))
             {
                 validSkippedNoKey++;
@@ -256,9 +228,10 @@ public sealed class InsertDetectionProcessor : BackgroundService
             if (!seenValidKeys.Add(key))
                 continue;
 
+            validDistinctKeys++;
             comparedValidKeys++;
 
-            // Deduct if it appears in Update/Skip (defensive)
+            // Defensive deduction
             if (updateKeySet.Contains(key) || skipKeySet.Contains(key))
                 continue;
 
@@ -266,27 +239,24 @@ public sealed class InsertDetectionProcessor : BackgroundService
             if (destKeySet.Contains(key))
                 continue;
 
-            // Build insert payload row from Valid_Data fields
-            var vUserId = ChooseValidUserId(validDoc);
-            var vId = ChooseValidId(validDoc);
+            // Build insert row FROM VALID schema (userid + "id " supported)
+            var vUserId = GetBestField(validDoc, "user_id", "userId", "UserId", "userid");
+            var vId = GetBestField(validDoc, "id", "Id", "id ");
 
-            var vTitle = GetFieldWithCasingFallback(validDoc, "Title");
-            if (vTitle.IsBsonNull) vTitle = GetFieldWithCasingFallback(validDoc, "title");
+            // Destination schema uses user_id + id
+            if (vUserId.IsBsonNull || vId.IsBsonNull)
+                continue;
 
-            var vBody = GetFieldWithCasingFallback(validDoc, "Body");
-            if (vBody.IsBsonNull) vBody = GetFieldWithCasingFallback(validDoc, "body");
+            var vTitle = GetBestField(validDoc, "Title", "title");
+            var vBody = GetBestField(validDoc, "Body", "body");
 
             var outDoc = new BsonDocument
             {
-                // inserts have no objectid yet
                 { "objectid", BsonNull.Value },
-
-                // keep consistent with your destination schema
                 { "user_id", vUserId },
                 { "id", vId },
                 { "title", vTitle.IsBsonNull ? BsonNull.Value : vTitle },
                 { "body", vBody.IsBsonNull ? BsonNull.Value : vBody },
-
                 { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key }
             };
 
@@ -317,10 +287,12 @@ public sealed class InsertDetectionProcessor : BackgroundService
 
             { "destOidField", oidField },
             { "destObjectIdCount", objectIds.Count },
-            { "destDistinctKeys", destKeysBuilt },
+            { "destRecordsSeen", destRecordsSeen },
+            { "destDistinctKeys", destDistinctKeys },
             { "destSkippedNoAttrs", destSkippedNoAttrs },
             { "destSkippedNoKey", destSkippedNoKey },
 
+            { "validDistinctKeys", validDistinctKeys },
             { "validSkippedNoKey", validSkippedNoKey },
             { "comparedValidKeys", comparedValidKeys },
 
@@ -339,12 +311,30 @@ public sealed class InsertDetectionProcessor : BackgroundService
             ct);
 
         _logger.LogInformation(
-            "Insert_Data snapshot updated. destDistinctKeys={DestKeys} comparedValidKeys={Compared} insertCount={InsertCount} mongo={Db}.{Col} _id={Id}",
-            destKeysBuilt, comparedValidKeys, insertCount, _mongo.Database, _mongo.InsertCollection, InsertLatestId);
+            "Insert_Data updated. destDistinctKeys={DestKeys} validDistinctKeys={ValidKeys} comparedValidKeys={Compared} inserts={Inserts}",
+            destDistinctKeys, validDistinctKeys, comparedValidKeys, insertCount);
+    }
+
+    private static async Task WriteWaiting(IMongoCollection<BsonDocument> col, string status, CancellationToken ct)
+    {
+        var envelope = new BsonDocument
+        {
+            { "_id", InsertLatestId },
+            { "status", status },
+            { "insertCount", 0 },
+            { "itemCount", 0 },
+            { "payload", new BsonArray() }
+        };
+
+        await col.ReplaceOneAsync(
+            Builders<BsonDocument>.Filter.Eq("_id", InsertLatestId),
+            envelope,
+            new ReplaceOptions { IsUpsert = true },
+            ct);
     }
 
     // ----------------------------------------------------------------
-    // Destination querying (same pattern as DestinationRawSyncProcessor)
+    // Destination querying
     // ----------------------------------------------------------------
 
     private async Task<(string oidField, List<int> objectIds)> QueryAllObjectIds(string layerUrl, string token, CancellationToken ct)
@@ -402,7 +392,6 @@ public sealed class InsertDetectionProcessor : BackgroundService
     {
         var http = _httpFactory.CreateClient("arcgis");
 
-        // OutFields: keep user config unless you want to optimize later.
         var qs = new Dictionary<string, string>
         {
             ["where"] = _dest.Where,
@@ -488,14 +477,12 @@ public sealed class InsertDetectionProcessor : BackgroundService
         _token = token;
         _tokenExpiresAtUtc = expiresAtUtc;
 
-        _logger.LogInformation("Portal token acquired. expiresAtUtc={Expires}", _tokenExpiresAtUtc);
         return token;
     }
 
     private static bool TryGetIntLike(JsonElement el, out int value)
     {
         value = default;
-
         try
         {
             return el.ValueKind switch
@@ -508,16 +495,12 @@ public sealed class InsertDetectionProcessor : BackgroundService
                 _ => false
             };
         }
-        catch
-        {
-            return false;
-        }
+        catch { return false; }
     }
 
     private static IEnumerable<List<int>> Chunk(List<int> source, int size)
     {
         if (size <= 0) size = 1;
-
         for (var i = 0; i < source.Count; i += size)
         {
             var take = Math.Min(size, source.Count - i);
@@ -538,69 +521,41 @@ public sealed class InsertDetectionProcessor : BackgroundService
         return sb.ToString();
     }
 
-    // ------------------------------------------------------------
-    // Key + casing helpers (aligned with your other workers)
-    // ------------------------------------------------------------
+    // ----------------------------------------------------------------
+    // Key + field helpers (this is the core fix)
+    // ----------------------------------------------------------------
 
-    private BsonValue ChooseValidUserId(BsonDocument validDoc)
+    private string BuildCandidateKeyFromAnyDoc(BsonDocument doc)
     {
-        var v = GetFieldWithCasingFallback(validDoc, "UserId");
-        if (!v.IsBsonNull) return v;
+        // prefer stored key if present
+        var existing = GetStringCaseInsensitive(doc, _dup.ComputedKeyFieldName ?? "Candidate_Key_combination");
+        var existingNorm = NormalizeKey(existing);
+        if (!string.IsNullOrWhiteSpace(existingNorm))
+            return existingNorm;
 
-        v = GetFieldWithCasingFallback(validDoc, "userId");
-        if (!v.IsBsonNull) return v;
+        var user = GetBestField(doc, "user_id", "userid", "userId", "UserId");
+        var id = GetBestField(doc, "id", "Id", "id ");
 
-        v = GetFieldWithCasingFallback(validDoc, "user_id");
-        return v;
-    }
+        if (user.IsBsonNull || id.IsBsonNull) return "";
 
-    private BsonValue ChooseValidId(BsonDocument validDoc)
-    {
-        var v = GetFieldWithCasingFallback(validDoc, "Id");
-        if (!v.IsBsonNull) return v;
+        var u = NormalizeForCompare(user);
+        var i = NormalizeForCompare(id);
+        if (string.IsNullOrWhiteSpace(u) || string.IsNullOrWhiteSpace(i)) return "";
 
-        v = GetFieldWithCasingFallback(validDoc, "id");
-        return v;
-    }
-
-    private string ComputeKeyFromAnyDoc(BsonDocument doc)
-    {
-        var fields = _dup.CandidateKeyFields ?? Array.Empty<string>();
-        if (fields.Length == 0) return "";
-
-        var parts = new List<string>(fields.Length);
-
-        foreach (var f0 in fields)
-        {
-            var f = (f0 ?? "").Trim();
-            if (string.IsNullOrWhiteSpace(f)) return "";
-
-            var v = GetFieldWithCasingFallback(doc, f);
-            if (v.IsBsonNull) return "";
-
-            var part = NormalizeKeyPart(v);
-            if (string.IsNullOrWhiteSpace(part)) return "";
-
-            parts.Add(part);
-        }
-
-        return string.Join(_dup.KeyJoiner ?? "", parts);
+        return $"{u}{(_dup.KeyJoiner ?? "|")}{i}";
     }
 
     private static string NormalizeKey(string? s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return "";
-        return s.Trim();
-    }
+        => string.IsNullOrWhiteSpace(s) ? "" : s.Trim().TrimEnd(',');
 
-    private static string NormalizeFieldName(string s)
+    private static BsonValue GetBestField(BsonDocument doc, params string[] names)
     {
-        if (string.IsNullOrWhiteSpace(s)) return "";
-        var chars = new List<char>(s.Length);
-        foreach (var ch in s)
-            if (char.IsLetterOrDigit(ch))
-                chars.Add(char.ToLowerInvariant(ch));
-        return new string(chars.ToArray());
+        foreach (var n in names)
+        {
+            var v = GetFieldWithCasingFallback(doc, n);
+            if (!v.IsBsonNull) return v;
+        }
+        return BsonNull.Value;
     }
 
     private static string GetStringCaseInsensitive(BsonDocument doc, string fieldName)
@@ -609,25 +564,13 @@ public sealed class InsertDetectionProcessor : BackgroundService
             return "";
 
         foreach (var e in doc.Elements)
-        {
             if (string.Equals(e.Name, fieldName, StringComparison.OrdinalIgnoreCase))
-            {
-                if (e.Value.IsBsonNull) return "";
-                var s = e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? "");
-                return s ?? "";
-            }
-        }
+                return e.Value.IsBsonNull ? "" : (e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? ""));
 
         var target = NormalizeFieldName(fieldName);
         foreach (var e in doc.Elements)
-        {
             if (NormalizeFieldName(e.Name) == target)
-            {
-                if (e.Value.IsBsonNull) return "";
-                var s = e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? "");
-                return s ?? "";
-            }
-        }
+                return e.Value.IsBsonNull ? "" : (e.Value.BsonType == BsonType.String ? (e.Value.AsString ?? "") : (e.Value.ToString() ?? ""));
 
         return "";
     }
@@ -641,16 +584,6 @@ public sealed class InsertDetectionProcessor : BackgroundService
             if (string.Equals(e.Name, field, StringComparison.OrdinalIgnoreCase))
                 return e.Value;
 
-        var pas = ToPascalCase(field);
-        foreach (var e in doc.Elements)
-            if (string.Equals(e.Name, pas, StringComparison.OrdinalIgnoreCase))
-                return e.Value;
-
-        var cam = ToCamelCase(field);
-        foreach (var e in doc.Elements)
-            if (string.Equals(e.Name, cam, StringComparison.OrdinalIgnoreCase))
-                return e.Value;
-
         var target = NormalizeFieldName(field);
         foreach (var e in doc.Elements)
             if (NormalizeFieldName(e.Name) == target)
@@ -659,41 +592,21 @@ public sealed class InsertDetectionProcessor : BackgroundService
         return BsonNull.Value;
     }
 
-    private static string NormalizeKeyPart(BsonValue v)
+    private static string NormalizeFieldName(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return "";
+        var chars = new List<char>(s.Length);
+        foreach (var ch in s)
+            if (char.IsLetterOrDigit(ch))
+                chars.Add(char.ToLowerInvariant(ch));
+        return new string(chars.ToArray());
+    }
+
+    private static string NormalizeForCompare(BsonValue v)
     {
         if (v is null || v.IsBsonNull) return "";
-
-        try
-        {
-            return v.BsonType switch
-            {
-                BsonType.String => (v.AsString ?? "").Trim(),
-                BsonType.Int32 => v.AsInt32.ToString(CultureInfo.InvariantCulture),
-                BsonType.Int64 => v.AsInt64.ToString(CultureInfo.InvariantCulture),
-                BsonType.Double => v.AsDouble.ToString("G17", CultureInfo.InvariantCulture),
-                BsonType.Decimal128 => Decimal128.ToDecimal(v.AsDecimal128).ToString(CultureInfo.InvariantCulture),
-                BsonType.Boolean => v.AsBoolean ? "true" : "false",
-                _ => (v.ToString() ?? "").Trim()
-            };
-        }
-        catch
-        {
-            return (v.ToString() ?? "").Trim();
-        }
-    }
-
-    private static string ToPascalCase(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return s;
-        if (s.Length == 1) return s.ToUpperInvariant();
-        return char.ToUpperInvariant(s[0]) + s.Substring(1);
-    }
-
-    private static string ToCamelCase(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return s;
-        if (s.Length == 1) return s.ToLowerInvariant();
-        return char.ToLowerInvariant(s[0]) + s.Substring(1);
+        var s = v.BsonType == BsonType.String ? (v.AsString ?? "") : (v.ToString() ?? "");
+        return (s ?? "").Trim().TrimEnd(',');
     }
 
     private static TimeZoneInfo ResolveTimeZone(string? timeZoneId)
@@ -701,10 +614,7 @@ public sealed class InsertDetectionProcessor : BackgroundService
         if (string.IsNullOrWhiteSpace(timeZoneId))
             return TimeZoneInfo.Local;
 
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
-        }
+        try { return TimeZoneInfo.FindSystemTimeZoneById(timeZoneId); }
         catch
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -716,8 +626,7 @@ public sealed class InsertDetectionProcessor : BackgroundService
 
             if (map.TryGetValue(timeZoneId, out var windowsId))
             {
-                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); }
-                catch { }
+                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); } catch { }
             }
 
             return TimeZoneInfo.Local;

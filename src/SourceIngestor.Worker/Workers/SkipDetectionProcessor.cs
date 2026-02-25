@@ -12,11 +12,15 @@ namespace SourceIngestor.Worker.Workers;
 /// <summary>
 /// SkipDetectionProcessor builds Skip_Data snapshot:
 /// - "Skip" means: the record exists in Destination Feature Service AND matches Valid_Data exactly (user_id, id, title, body)
-/// - Also: if a key appears in Update_Data, we DO NOT allow it to be in Skip_Data (your rule).
+/// - Also: if a key appears in Update_Data, we DO NOT allow it to be in Skip_Data.
 ///
-/// IMPORTANT CHANGE (per your request):
-/// - Destination data is read DIRECTLY from the Destination Feature Service (live),
-///   not from Mongo Destination_Raw_Data snapshot.
+/// IMPORTANT:
+/// - Destination data is read DIRECTLY from the Destination Feature Service (live).
+///
+/// CRITICAL FIX:
+/// - Destination may contain duplicate candidate keys.
+/// - We MUST deduplicate destination per candidate key so skipCount <= validCount by design.
+/// - Winner rule (deterministic): smallest OBJECTID wins.
 /// </summary>
 public sealed class SkipDetectionProcessor : BackgroundService
 {
@@ -100,7 +104,6 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
         if (validSnap is null)
         {
-            // Valid_Data not ready yet
             await WriteWaiting(skipCol, "waiting_for_valid_latest", "Valid_Data snapshot not found yet.", ct);
             return;
         }
@@ -137,14 +140,14 @@ public sealed class SkipDetectionProcessor : BackgroundService
         var layerUrl = _dest.FeatureLayerUrl.TrimEnd('/');
 
         var (oidField, objectIds) = await QueryAllObjectIds(layerUrl, token, ct);
-
         var batchSize = Math.Max(1, _dest.QueryBatchSize);
 
-        // Index destination by candidate key => list of minimal docs
-        var destByKey = new Dictionary<string, List<BsonDocument>>(StringComparer.Ordinal);
+        // Winner per key: key => minimal destination record (deterministic: smallest OBJECTID).
+        var destWinnerByKey = new Dictionary<string, BsonDocument>(StringComparer.Ordinal);
 
-        var destKeysBuilt = 0;          // distinct keys
-        var destRecordsBuilt = 0;       // total records indexed
+        var destDistinctKeys = 0;        // distinct keys (after dedupe)
+        var destRecordsSeen = 0;         // total destination records scanned
+        var destDuplicatesCollapsed = 0; // how many duplicates were collapsed by winner selection
         var destSkippedNoAttrs = 0;
         var destSkippedNoKey = 0;
         var destSkippedNoObjectId = 0;
@@ -158,6 +161,8 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
             foreach (var feat in featuresEl.EnumerateArray())
             {
+                destRecordsSeen++;
+
                 if (!feat.TryGetProperty("attributes", out var attrsEl) || attrsEl.ValueKind != JsonValueKind.Object)
                 {
                     destSkippedNoAttrs++;
@@ -166,7 +171,6 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
                 var attrs = BsonDocument.Parse(attrsEl.GetRawText());
 
-                // Candidate key from destination attributes
                 var keyRaw = ComputeKeyFromAnyDoc(attrs);
                 var key = NormalizeKey(keyRaw);
                 if (string.IsNullOrWhiteSpace(key))
@@ -175,7 +179,6 @@ public sealed class SkipDetectionProcessor : BackgroundService
                     continue;
                 }
 
-                // Need OBJECTID to track unique destination record
                 var objectIdVal = GetFieldWithCasingFallback(attrs, oidField);
                 if (objectIdVal.IsBsonNull)
                 {
@@ -183,9 +186,16 @@ public sealed class SkipDetectionProcessor : BackgroundService
                     continue;
                 }
 
+                var oid = GetIntLike(objectIdVal);
+                if (oid is null)
+                {
+                    destSkippedNoObjectId++;
+                    continue;
+                }
+
                 var minimal = new BsonDocument
                 {
-                    { "objectid", objectIdVal },
+                    { "objectid", oid.Value },
                     { "user_id", GetFieldWithCasingFallback(attrs, "user_id").IsBsonNull ? GetFieldWithCasingFallback(attrs, "userId") : GetFieldWithCasingFallback(attrs, "user_id") },
                     { "id", GetFieldWithCasingFallback(attrs, "id") },
                     { "title", GetFieldWithCasingFallback(attrs, "title") },
@@ -193,32 +203,39 @@ public sealed class SkipDetectionProcessor : BackgroundService
                     { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key }
                 };
 
-                if (!destByKey.TryGetValue(key, out var list))
+                if (!destWinnerByKey.TryGetValue(key, out var existing))
                 {
-                    list = new List<BsonDocument>(capacity: 1);
-                    destByKey[key] = list;
-                    destKeysBuilt++;
+                    destWinnerByKey[key] = minimal;
+                    destDistinctKeys++;
+                    continue;
                 }
 
-                list.Add(minimal);
-                destRecordsBuilt++;
+                // Winner selection: smallest OBJECTID wins (stable and deterministic).
+                var existingOid = GetIntLike(existing.GetValue("objectid", BsonNull.Value));
+                if (existingOid is null || oid.Value < existingOid.Value)
+                {
+                    destWinnerByKey[key] = minimal;
+                }
+
+                destDuplicatesCollapsed++;
             }
         }
 
-        // Compare Valid_Data vs Destination FS for exact match => Skip_Data
+        // Compare Valid_Data vs destination winner per key for exact match => Skip_Data
         var validPayload = validPayloadVal.AsBsonArray;
 
         var skipPayload = new BsonArray();
 
+        var validCount = validPayload.Count;
+        var validDistinctKeys = 0;
+
         var comparedKeys = 0;
         var matchedKeys = 0;
-        var matchedRecords = 0;
 
         var skipCount = 0;
         var validSkippedNoKey = 0;
 
         var seenKeys = new HashSet<string>(StringComparer.Ordinal);
-        var seenObjectIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var v in validPayload)
         {
@@ -227,7 +244,6 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
             var validDoc = v.AsBsonDocument;
 
-            // Candidate key from Valid_Data
             var keyFromField = GetStringCaseInsensitive(validDoc, _dup.ComputedKeyFieldName ?? "");
             var key = NormalizeKey(keyFromField);
 
@@ -243,16 +259,17 @@ public sealed class SkipDetectionProcessor : BackgroundService
             if (!seenKeys.Add(key))
                 continue;
 
+            validDistinctKeys++;
             comparedKeys++;
-
-            if (!destByKey.TryGetValue(key, out var destList) || destList.Count == 0)
-                continue;
-
-            matchedKeys++;
 
             // Rule: if in Update_Data => do NOT include in Skip_Data
             if (updateKeySet.Contains(key))
                 continue;
+
+            if (!destWinnerByKey.TryGetValue(key, out var destMin))
+                continue;
+
+            matchedKeys++;
 
             // Valid fields (source-of-truth)
             var vUserId = ChooseValidUserId(validDoc);
@@ -264,46 +281,35 @@ public sealed class SkipDetectionProcessor : BackgroundService
             var vBody = GetFieldWithCasingFallback(validDoc, "Body");
             if (vBody.IsBsonNull) vBody = GetFieldWithCasingFallback(validDoc, "body");
 
-            foreach (var destMin in destList)
+            var dUserId = destMin.GetValue("user_id", BsonNull.Value);
+            var dId = destMin.GetValue("id", BsonNull.Value);
+            var dTitle = destMin.GetValue("title", BsonNull.Value);
+            var dBody = destMin.GetValue("body", BsonNull.Value);
+
+            var userOk = BsonValuesEqual(vUserId, dUserId);
+            var idOk = BsonValuesEqual(vId, dId);
+            var titleOk = BsonValuesEqual(vTitle, dTitle);
+            var bodyOk = BsonValuesEqual(vBody, dBody);
+
+            if (!userOk || !idOk || !titleOk || !bodyOk)
+                continue;
+
+            var objectId = destMin.GetValue("objectid", BsonNull.Value);
+            if (objectId.IsBsonNull)
+                continue;
+
+            var outDoc = new BsonDocument
             {
-                matchedRecords++;
+                { "objectid", objectId },
+                { "user_id", dUserId.IsBsonNull ? vUserId : dUserId },
+                { "id", dId.IsBsonNull ? vId : dId },
+                { "title", dTitle.IsBsonNull ? vTitle : dTitle },
+                { "body", dBody.IsBsonNull ? vBody : dBody },
+                { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key }
+            };
 
-                var dUserId = destMin.GetValue("user_id", BsonNull.Value);
-                var dId = destMin.GetValue("id", BsonNull.Value);
-                var dTitle = destMin.GetValue("title", BsonNull.Value);
-                var dBody = destMin.GetValue("body", BsonNull.Value);
-
-                // Exact match on all 4 fields
-                var userOk = BsonValuesEqual(vUserId, dUserId);
-                var idOk = BsonValuesEqual(vId, dId);
-                var titleOk = BsonValuesEqual(vTitle, dTitle);
-                var bodyOk = BsonValuesEqual(vBody, dBody);
-
-                if (!userOk || !idOk || !titleOk || !bodyOk)
-                    continue;
-
-                var objectId = destMin.GetValue("objectid", BsonNull.Value);
-                if (objectId.IsBsonNull)
-                    continue;
-
-                var oidKey = NormalizeForCompare(objectId);
-                if (!seenObjectIds.Add(oidKey))
-                    continue;
-
-                // Store the destination record as the "skip record"
-                var outDoc = new BsonDocument
-                {
-                    { "objectid", objectId },
-                    { "user_id", dUserId.IsBsonNull ? vUserId : dUserId },
-                    { "id", dId.IsBsonNull ? vId : dId },
-                    { "title", dTitle.IsBsonNull ? vTitle : dTitle },
-                    { "body", dBody.IsBsonNull ? vBody : dBody },
-                    { _dup.ComputedKeyFieldName ?? "Candidate_Key_combination", key }
-                };
-
-                skipPayload.Add(outDoc);
-                skipCount++;
-            }
+            skipPayload.Add(outDoc);
+            skipCount++;
         }
 
         // Write Skip_Data snapshot
@@ -327,18 +333,20 @@ public sealed class SkipDetectionProcessor : BackgroundService
             { "fetchedAtLocalText", fetchedAtLocalText },
             { "timeZoneId", timeZoneDisplay },
 
+            { "validCount", validCount },
+            { "validDistinctKeys", validDistinctKeys },
+            { "validSkippedNoKey", validSkippedNoKey },
+
             { "destObjectIdCount", objectIds.Count },
-            { "destDistinctKeys", destKeysBuilt },
-            { "destRecordsBuilt", destRecordsBuilt },
+            { "destRecordsSeen", destRecordsSeen },
+            { "destDistinctKeys", destDistinctKeys },
+            { "destDuplicatesCollapsed", destDuplicatesCollapsed },
             { "destSkippedNoAttrs", destSkippedNoAttrs },
             { "destSkippedNoKey", destSkippedNoKey },
             { "destSkippedNoObjectId", destSkippedNoObjectId },
 
-            { "validSkippedNoKey", validSkippedNoKey },
-
             { "comparedValidKeys", comparedKeys },
             { "matchedKeys", matchedKeys },
-            { "matchedRecords", matchedRecords },
 
             { "deductedUpdateKeysCount", updateKeySet.Count },
 
@@ -354,8 +362,8 @@ public sealed class SkipDetectionProcessor : BackgroundService
             ct);
 
         _logger.LogInformation(
-            "Skip_Data snapshot updated (LIVE FS). comparedValidKeys={Compared} matchedKeys={MatchedKeys} matchedRecords={MatchedRecords} skipCount={SkipCount}",
-            comparedKeys, matchedKeys, matchedRecords, skipCount);
+            "Skip_Data snapshot updated (LIVE FS, deduped). validCount={ValidCount} validDistinctKeys={ValidDistinctKeys} comparedKeys={Compared} matchedKeys={MatchedKeys} skipCount={SkipCount} (guaranteed skipCount<=validCount).",
+            validCount, validDistinctKeys, comparedKeys, matchedKeys, skipCount);
     }
 
     private async Task WriteWaiting(IMongoCollection<BsonDocument> skipCol, string status, string reason, CancellationToken ct)
@@ -462,7 +470,7 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
         var qs = new Dictionary<string, string>
         {
-            ["where"] = _dest.Where,
+            ["where"] = _dest.Where ?? "1=1",
             ["returnIdsOnly"] = "true",
             ["f"] = "json",
             ["token"] = token
@@ -507,9 +515,9 @@ public sealed class SkipDetectionProcessor : BackgroundService
 
         var qs = new Dictionary<string, string>
         {
-            ["where"] = _dest.Where,
+            ["where"] = _dest.Where ?? "1=1",
             ["objectIds"] = string.Join(",", objectIds),
-            ["outFields"] = _dest.OutFields,
+            ["outFields"] = _dest.OutFields ?? "*",
             ["returnGeometry"] = "false",
             ["orderByFields"] = oidField,
             ["f"] = "json",
@@ -650,6 +658,26 @@ public sealed class SkipDetectionProcessor : BackgroundService
                 return e.Value;
 
         return BsonNull.Value;
+    }
+
+    private static int? GetIntLike(BsonValue v)
+    {
+        try
+        {
+            return v.BsonType switch
+            {
+                BsonType.Int32 => v.AsInt32,
+                BsonType.Int64 when v.AsInt64 >= int.MinValue && v.AsInt64 <= int.MaxValue => (int)v.AsInt64,
+                BsonType.Double => (int)v.AsDouble,
+                BsonType.Decimal128 => (int)Decimal128.ToDecimal(v.AsDecimal128),
+                BsonType.String when int.TryParse(v.AsString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i) => i,
+                _ => null
+            };
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static bool BsonValuesEqual(BsonValue a, BsonValue b)
