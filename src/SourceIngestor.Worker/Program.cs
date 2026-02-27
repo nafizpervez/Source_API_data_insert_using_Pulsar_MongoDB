@@ -44,24 +44,8 @@ builder.Services.AddSingleton<IMongoClient>(_ =>
 // Hosted services
 builder.Services.AddHostedService<SourceCheckProcessor>();
 builder.Services.AddHostedService<MongoWriter>();
-builder.Services.AddHostedService<ValidationProcessor>();
 
-// Destination worker remains as-is
-builder.Services.AddHostedService<DestinationRawSyncProcessor>();
-
-// Update detection worker
-builder.Services.AddHostedService<UpdateDetectionProcessor>();
-
-// Skip detection worker (writes Skip_Data snapshot)
-builder.Services.AddHostedService<SkipDetectionProcessor>();
-
-// Delete detection worker (writes Delete_Data snapshot)
-builder.Services.AddHostedService<DeleteDetectionProcessor>();
-
-// Insert detection worker (writes Insert_Data snapshot)
-builder.Services.AddHostedService<InsertDetectionProcessor>();
-
-// NEW: Apply changes to Destination Feature Service + write Final_Destination_Data + audit success/fail
+// SINGLE orchestrator (does: valid/dup/skip/update/delete/insert/applyEdits/final/counts)
 builder.Services.AddHostedService<DestinationCheckProcessor>();
 
 var host = builder.Build();

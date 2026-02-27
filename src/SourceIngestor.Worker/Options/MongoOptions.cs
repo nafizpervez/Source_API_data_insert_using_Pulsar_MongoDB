@@ -6,42 +6,36 @@ public sealed class MongoOptions
     public string Database { get; set; } = "";
 
     // Source collection (raw batches)
-    public string Collection { get; set; } = "";
+    public string Collection { get; set; } = "Source_Data";
 
-    // Target collection (validated/typed batches)
-    public string ValidatedCollection { get; set; } = "ValidatedSourceData";
+    // Source validation outputs (single snapshot docs)
+    public string ValidatedCollection { get; set; } = "Valid_Source_Data";
+    public string InvalidCollection { get; set; } = "Invalid_Data";
+    public string DuplicatedCollection { get; set; } = "Duplicate_Data";
 
-    // Target collection (invalid items from the batch)
-    public string InvalidCollection { get; set; } = "InvalidSourceData";
+    // Destination snapshots (single snapshot docs)
+    public string DestinationCollection { get; set; } = "Destination_Data";
+    public string ValidDestinationCollection { get; set; } = "Valid_Destination_Data";
 
-    // duplicate items collection (dedup output)
-    public string DuplicatedCollection { get; set; } = "Duplicated_Data";
-
-    // Destination raw snapshot collection (ArcGIS FS read)
-    public string DestinationRawCollection { get; set; } = "Destination_Raw_Data";
-
-    // update items snapshot collection (diff output)
+    // Diff outputs (single snapshot docs)
     public string UpdateCollection { get; set; } = "Update_Data";
-
-    // skip items snapshot collection (exact match output)
     public string SkipCollection { get; set; } = "Skip_Data";
-
-    // delete items snapshot collection (exists in destination but NOT in source)
     public string DeleteCollection { get; set; } = "Delete_Data";
-
-    // insert items snapshot collection (exists in source but NOT in destination)
     public string InsertCollection { get; set; } = "Insert_Data";
 
-    // Source API fetch outcome collections (same DB)
+    // Final destination snapshot after edits
+    public string FinalDestinationCollection { get; set; } = "Final_Destination_Data";
+
+    // Count summary
+    public string CountSummaryCollection { get; set; } = "Count_Summary";
+
+    // Source API fetch outcome collections
     public string SourceSuccessIdCollection { get; set; } = "Source_Success_ID";
     public string SourceFailedIdCollection { get; set; } = "Source_Failed_ID";
 
-    // NEW: Destination apply outcome collections
+    // Destination apply outcome collections
     public string DestinationSuccessIdCollection { get; set; } = "Destination_Success_ID";
     public string DestinationFailedIdCollection { get; set; } = "Destination_Failed_ID";
-
-    // NEW: Final dataset snapshot after applying Update/Delete/Insert
-    public string FinalDestinationCollection { get; set; } = "Final_Destination_Data";
 
     public string? TimeZoneId { get; set; }
 }
