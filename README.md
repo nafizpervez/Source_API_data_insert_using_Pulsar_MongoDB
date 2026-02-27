@@ -2,7 +2,11 @@
 
 ## Architecture Overview
 
-End-to-end containerized pipeline implementing: source data ingestion → validation and deduplication → destination state snapshot → differential analysis → edit application → final state verification → multi-collection persistence (Pulsar messaging and MongoDB storage).
+End-to-end containerized pipeline implementing: 
+
+**source data ingestion → validation and deduplication → destination state snapshot → differential analysis → edit application → final state verification → multi-collection persistence** 
+
+(Pulsar messaging and MongoDB storage).
 
 ## 1) Remove Existing Containers + Images (Clean Reset)
 
